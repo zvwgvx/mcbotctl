@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mcbotctl</title>
+<link rel="stylesheet" href="/glass.css">
+</head>
+<body>
+<div class="scene"><i></i><i></i><i></i><i></i></div>
+
+<div class="wrap">
+  <header class="glass" style="--radius:20px">
+    <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+    <div class="content row">
+      <div>
+        <h1>mcbotctl</h1>
+        <p class="sub" id="target">connecting…</p>
+      </div>
+      <div class="row gap">
+        <span class="pill" id="conn">SSE: —</span>
+        <button id="btn-contrast" class="btn ghost" title="Turn the glass effect off for maximum text contrast">High contrast</button>
+      </div>
+    </div>
+  </header>
+
+  <nav class="tabs glass" style="--radius:16px">
+    <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+    <div class="content row">
+      <button class="tab is-on" data-tab="server">Server</button>
+      <button class="tab" data-tab="accounts">Accounts</button>
+      <button class="tab" data-tab="party">Party</button>
+      <button class="tab" data-tab="commands">Commands</button>
+      <button class="tab" data-tab="log">Log</button>
+      <span class="sub" id="tab-status"></span>
+    </div>
+  </nav>
+
+  <!-- ── Server ───────────────────────────────────────────────────── -->
+  <section class="panel" data-panel="server">
+    <div class="glass" style="--radius:20px">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>Test server</h2>
+        <p class="sub">Bots connect one second apart, send /register, then /login. Each bot card
+          shows connection, login, BedWars join and party join separately.</p>
+        <div class="field">
+          <input id="address" spellcheck="false" placeholder="127.0.0.1:25566">
+          <button id="btn-connect" class="btn primary">Join server</button>
+          <button id="btn-disconnect" class="btn ghost">Disconnect all</button>
+        </div>
+        <p class="sub" id="connect-msg"></p>
+        <div class="row wrap gap" style="justify-content:flex-start;margin-top:4px">
+          <button id="btn-walk" class="btn">Start walking</button>
+          <span class="sub">random W/A/S/D — the bots wander. Not pathfinding: they move, they do not navigate.</span>
+        </div>
+      </div>
+    </div>
+    <div class="glass" style="--radius:20px">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>Bot squad <span class="sub" id="ready-count"></span><span class="sub" id="walk-count"></span></h2>
+        <p class="sub">✓ Confirmed · × Not done · ? Not confirmed · – Not required</p>
+        <div id="bots" class="bots"></div>
+      </div>
+    </div>
+    <div class="glass" style="--radius:20px">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>BedWars opening</h2>
+        <p class="sub">The selected bot stands at the generator until it has 16 iron, buys wool,
+          then sneak bridges to a configured neighboring island. Set the map coordinates and shop
+          layout in <code>config/default.json</code> first.</p>
+        <div class="row wrap gap" style="justify-content:flex-start">
+          <button id="btn-bedwars-start" class="btn primary">Start BedWars opening</button>
+          <button id="btn-bedwars-stop" class="btn ghost">Stop</button>
+          <span class="sub" id="bedwars-state">idle</span>
+        </div>
+        <p class="sub" id="bedwars-msg"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Accounts ─────────────────────────────────────────────────── -->
+  <section class="panel" data-panel="accounts" hidden>
+    <div class="glass" style="--radius:20px">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>Accounts <span class="sub" id="acc-count"></span></h2>
+        <p class="sub">One <code>username:password</code> per line. Names must be 3–16 characters of
+          <code>[A-Za-z0-9_]</code> — AuthMe disconnects shorter names at join and Minecraft caps the
+          length. Generate fills the box but does not save; save when you are happy with it.</p>
+        <div class="field gen">
+          <label>count</label><input id="gen-count" type="number" min="1" max="200" value="7">
+          <label>prefix</label><input id="gen-prefix" value="Bot" spellcheck="false">
+          <label>password</label><input id="gen-pass" value="changeme123" spellcheck="false">
+          <button id="btn-gen" class="btn">Generate</button>
+        </div>
+        <textarea id="accounts" spellcheck="false" rows="12"></textarea>
+        <div class="row gap" style="justify-content:flex-start;margin-top:10px">
+          <button id="btn-acc-save" class="btn primary">Save accounts</button>
+          <label class="chk"><input type="checkbox" id="acc-rebuild" checked> rebuild fleet</label>
+          <button id="btn-acc-disc" class="btn ghost">Disconnect</button>
+          <span class="sub" id="acc-msg"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Party ────────────────────────────────────────────────────── -->
+  <section class="panel" data-panel="party" hidden>
+    <div class="glass" style="--radius:20px">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>Party</h2>
+        <p class="sub">Formation is automatic while the fleet joins: the first bot in invites each
+          other bot as it arrives. Use <b>Invite all</b> to redo it by hand.</p>
+        <div class="row wrap gap" style="justify-content:flex-start">
+          <button id="btn-run" class="btn primary">p inv ... (bot 1 invites all)</button>
+          <button id="btn-join-all" class="btn">p join ... (all bots join bot 1)</button>
+          <button id="btn-disband" class="btn">Disband</button>
+          <button id="btn-leave" class="btn">Leave (all)</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="glass" style="--radius:20px">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>Members</h2>
+        <p class="sub">Kick removes one member from the party. The leader does the kicking.</p>
+        <div id="members" class="members"></div>
+      </div>
+    </div>
+
+    <div class="glass" style="--radius:20px">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>Master</h2>
+        <p class="sub">The master is a real player, not one of the bots. Invite them, then hand over
+          leadership. <b>Form party with master</b> does the whole sequence in one go.</p>
+        <div class="field">
+          <input id="master" spellcheck="false" placeholder="master account name">
+          <label class="chk"><input type="checkbox" id="promote" checked> promote</label>
+        </div>
+        <div class="field">
+          <label class="lbl">wait for master</label>
+          <input id="waitms" type="number" min="0" max="60000" step="500" value="6000" style="max-width:110px">
+          <span class="sub">ms</span>
+          <button id="btn-save-master" class="btn ghost">Save master</button>
+        </div>
+        <div class="row wrap gap" style="justify-content:flex-start;margin-top:6px">
+          <button id="btn-master" class="btn primary">Form party with master</button>
+          <button id="btn-invite-master" class="btn">Invite master</button>
+          <button id="btn-transfer-master" class="btn">Transfer to master</button>
+        </div>
+        <p class="sub" id="master-msg"></p>
+      </div>
+    </div>
+
+    <div class="glass" style="--radius:20px">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>Menu</h2>
+        <p class="sub">Drives a chest-style GUI: select a hotbar slot, right-click to open the menu,
+          then click a slot inside it. Row and column are counted from 1, the way you count them on
+          screen. This uses real mouse clicks, not number keys.</p>
+        <div class="field">
+          <label class="lbl">hotbar</label><input id="m-hotbar" type="number" min="1" max="9" value="5" style="max-width:64px">
+          <label class="lbl">row</label><input id="m-row" type="number" min="1" max="6" value="4" style="max-width:64px">
+          <label class="lbl">col</label><input id="m-col" type="number" min="1" max="9" value="4" style="max-width:64px">
+          <select id="m-button" class="sel"><option value="right">right click</option><option value="left">left click</option></select>
+        </div>
+        <div class="field">
+          <label class="lbl">title must contain</label>
+          <input id="m-title" spellcheck="false" placeholder="optional — catches the wrong menu">
+        </div>
+        <div class="row wrap gap" style="justify-content:flex-start;margin-top:6px">
+          <button id="btn-menu" class="btn primary">Open menu + click slot</button>
+          <button id="btn-menu-save" class="btn ghost">Save menu settings</button>
+        </div>
+        <p class="sub" id="menu-msg"></p>
+      </div>
+    </div>
+
+    <div class="glass" style="--radius:20px">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>Sneak bridge</h2>
+        <p class="sub">Holds sneak, walks in the chosen direction, and places a block into the gap
+          ahead of each step. Sneak is released when the bot can no longer move — the bridge is
+          done. Needs blocks in the inventory.</p>
+        <div class="field">
+          <label class="lbl">yaw</label><input id="b-yaw" type="number" value="0" style="max-width:80px">
+          <label class="lbl">blocks</label><input id="b-blocks" type="number" min="1" max="64" value="8" style="max-width:70px">
+          <label class="lbl">on obstacle</label>
+          <select id="b-obstacle" class="sel">
+            <option value="stop">stop</option>
+            <option value="back">turn back</option>
+            <option value="up">go up</option>
+          </select>
+        </div>
+        <div class="row wrap gap" style="justify-content:flex-start;margin-top:6px">
+          <button id="btn-bridge" class="btn primary">Sneak bridge</button>
+          <button id="btn-bridge-save" class="btn ghost">Save bridge settings</button>
+        </div>
+        <p class="sub" id="bridge-msg"></p>
+      </div>
+    </div>
+
+    <div class="glass" style="--radius:20px">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>Server actions</h2>
+        <p class="sub">Warp uses your server's own warp plugin, so edit the command on the Commands
+          tab if <code>/warp</code> is not what yours uses.</p>
+        <div class="field">
+          <input id="warp-name" spellcheck="false" placeholder="warp name" value="spawn" style="max-width:200px">
+          <button id="btn-warp" class="btn">Warp (leader)</button>
+          <button id="btn-warp-all" class="btn">Warp (all)</button>
+        </div>
+        <p class="sub" id="action-msg"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Commands ─────────────────────────────────────────────────── -->
+  <section class="panel" data-panel="commands" hidden>
+    <div class="glass" style="--radius:20px">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>Command config</h2>
+        <p class="sub">Type the real server command. <code>{player}</code> is the target,
+          <code>{message}</code> the body, <code>{warp}</code> the warp name. Press <b>Learn</b> to
+          make a bot send it and read the reply back.</p>
+        <div id="cmds"></div>
+        <div class="row gap" style="justify-content:flex-start;margin-top:14px">
+          <button id="btn-save" class="btn primary">Save commands</button>
+          <span class="sub" id="save-msg"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Log ──────────────────────────────────────────────────────── -->
+  <section class="panel" data-panel="log" hidden>
+    <div class="glass" style="--radius:20px">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>Live log <button id="btn-clear" class="btn ghost tiny">clear</button></h2>
+        <div id="log" class="log tall"></div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div id="learn" class="modal" hidden>
+  <div class="glass" style="--radius:20px">
+    <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+    <div class="content">
+      <div class="row">
+        <h2>Learn from a real reply</h2>
+        <button id="learn-close" class="btn ghost">close</button>
+      </div>
+      <p class="sub" id="learn-head"></p>
+      <div id="learn-lines" class="lines"></div>
+      <p class="sub">Pick a line as <b>success</b> or <b>failure</b> and a regex is generated for you.</p>
+      <div id="learn-out" class="out"></div>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

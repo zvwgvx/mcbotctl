@@ -1,0 +1,8 @@
+# Test-bed accounts. The real account list lives in accounts.txt.
+Soprano:matkhau1
+Mezzo:matkhau2
+Alto:matkhau3
+Tenor:matkhau4
+Baritone:matkhau5
+Bass:matkhau6
+Countertenor:matkhau7

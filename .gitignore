@@ -1,0 +1,20 @@
+node_modules/
+
+# Run output. logs/results*.jsonl record the full command line of every /login and
+# /register, so this stays out of the repo even though it is only JSON.
+logs/*.log
+logs/*.jsonl
+
+# Real credentials only. The two shipped *.example/testbed lists are placeholders.
+accounts/*.txt
+!accounts/accounts.example.txt
+!accounts/testbed.txt
+
+# Your real config lives here. config/default.json is the sanitized one that ships.
+config/local.json
+
+# Server runtime: world, jars, logs, plugin databases.
+server/data/
+
+# Plugin build output (regenerate with plugin/build.sh).
+plugin/build/

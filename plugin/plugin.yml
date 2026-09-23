@@ -1,0 +1,39 @@
+name: McbotctlParty
+version: 1.0.0
+main: vn.mcbotctl.party.PartyPlugin
+description: Reference party plugin for mcbotctl - every command name and announcement message is configurable
+author: mcbotctl
+commands:
+  p:
+    description: Party command
+    usage: /p <subcommand>
+  pc:
+    description: Chat inside the party
+    usage: /pc <content>
+  where:
+    description: Report the player's real coordinates - used to verify movement
+    usage: /where
+  # QUOTED ON PURPOSE: an unquoted `off` is a YAML 1.1 boolean, so SnakeYAML hands Bukkit
+  # the key `false` and the command is registered under the wrong name - /off then answers
+  # "Unknown command" with nothing anywhere saying why. Same trap for on/yes/no/n/y.
+  "off":
+    description: Mark yourself offline in the party
+    usage: /off
+  reset:
+    description: Teleport to an open spot, for repeatable movement measurements
+    usage: /reset
+  blockat:
+    description: Report the block at coordinates, server-side - used to verify block placement
+    usage: /blockat <x> <y> <z>
+  blocks:
+    description: Give the player building blocks in a known hotbar slot
+    usage: /blocks
+  platform:
+    description: Put the player on a single block in the air, for bridging tests
+    usage: /platform
+  bwtest:
+    description: Create a private BedWars generator, shop and adjacent island fixture
+    usage: /bwtest
+  bwstatus:
+    description: Report the BedWars fixture coordinates and server-side inventory counts
+    usage: /bwstatus

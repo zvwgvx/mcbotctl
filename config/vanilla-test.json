@@ -1,0 +1,86 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 25566,
+    "version": "1.8.8"
+  },
+  "auth": {
+    "_comment": "Enable when the server has an AuthMe-style login plugin. Disable for a plain offline-mode server.",
+    "enabled": true,
+    "login": {
+      "template": "/login {password}",
+      "timeoutMs": 4000
+    },
+    "register": {
+      "template": "/register {password} {password}",
+      "enabled": true
+    },
+    "staggerMs": 400,
+    "successPattern": "loginSuccess",
+    "failurePattern": "loginWrongPassword"
+  },
+  "commands": {
+    "_comment": "The operator fills this in. Put the real command names here. {player} = target, {message} = body.",
+    "invite": {
+      "template": "/me invites {player}",
+      "timeoutMs": 2000,
+      "success": "invites (?<target>\\w+)",
+      "failure": [
+        "unknownCommand",
+        "noPermission"
+      ]
+    },
+    "accept": {
+      "template": "/p join {player}",
+      "timeoutMs": 1500
+    },
+    "deny": {
+      "template": "/p deny {player}",
+      "timeoutMs": 1500
+    },
+    "leave": {
+      "template": "/p leave",
+      "timeoutMs": 1500
+    },
+    "disband": {
+      "template": "/p disband",
+      "timeoutMs": 2000
+    },
+    "transfer": {
+      "template": "/me transfers to {player}",
+      "timeoutMs": 1,
+      "success": "transfers to",
+      "failure": [
+        "unknownCommand"
+      ]
+    },
+    "promote": {
+      "template": "/p promote {player}",
+      "timeoutMs": 1500
+    },
+    "chat": {
+      "template": "/pc {message}",
+      "timeoutMs": 1500
+    },
+    "_successPatterns": {
+      "invite": "invitedBy",
+      "accept": "youJoined",
+      "leave": "partyDisbanded"
+    },
+    "_failurePatterns": {
+      "invite": [
+        "unknownCommand",
+        "unknownPlayer",
+        "noPermission",
+        "notInParty"
+      ]
+    },
+    "__note": "test build: invite uses /me to guarantee success, disband uses /p to guarantee failure"
+  },
+  "flow": {
+    "leaderIndex": 0,
+    "connectStaggerMs": 350,
+    "partySize": 7
+  },
+  "patterns": {}
+}

@@ -1,0 +1,16 @@
+# List of accounts, one per line: username:password
+# Lines starting with # are comments.
+#
+# CONSTRAINTS (empirically verified):
+#   - AuthMe default: the name must be >= 3 chars, otherwise the player is disconnected
+#     right away: "Your username is either too short or too long!"
+#     (changeable in plugins/AuthMe/config.yml -> settings.restrictions.minNicknameLength)
+#   - Minecraft 1.8.9: name is at most 16 chars, only [A-Za-z0-9_]
+#
+Soprano:matkhau1
+Mezzo:matkhau2
+Alto:matkhau3
+Tenor:matkhau4
+Baritone:matkhau5
+Bass:matkhau6
+Countertenor:matkhau7

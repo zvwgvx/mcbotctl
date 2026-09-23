@@ -1,0 +1,311 @@
+{
+  "$comment": "mcbotctl v1. Filled example; every value here was exercised against PaperSpigot 1.8.8-445 + AuthMe 5.6.0 on 127.0.0.1:25566.",
+  "server": {
+    "host": "play.example.net",
+    "port": 25565,
+    "version": "1.8.9",
+    "chatVersion": "1.8",
+    "_versionNote": "version MUST be present. minecraft-protocol 1.68.0 defaults to 26.1 and would handshake as a modern client. '1.8.9' is not in its supportedVersions array (which lists 1.8.8) but minecraft-data resolves both to protocol 47.",
+    "_portNote": "25565 on this machine is an unrelated production Paper server. 25566 is the dockerised test bed.",
+    "checkTimeoutIntervalMs": 60000
+  },
+  "accounts": {
+    "file": "accounts/accounts.txt"
+  },
+  "auth": {
+    "enabled": true,
+    "strategy": "register-first",
+    "messageIntervalMs": 5000,
+    "_strategyNote": "register-first sends /register on every new server join, then /login after any nonfatal registration result. 'Already registered' alone never marks the bot READY. Successful login and 'already logged in' do; an unrecognised silent login may use the existing two-prompt-interval fallback. A wrong login password is fatal and is never retried.",
+    "login": {
+      "template": "/login {password}",
+      "timeoutMs": 4000,
+      "success": [
+        "loginSuccess"
+      ],
+      "failure": [
+        "wrongPassword",
+        "notRegistered",
+        "alreadyLoggedIn",
+        "authRequired"
+      ]
+    },
+    "register": {
+      "enabled": true,
+      "template": "/register {password} {password}",
+      "timeoutMs": 4000,
+      "success": [
+        "registerSuccess",
+        "loginSuccess"
+      ],
+      "failure": [
+        "alreadyRegistered",
+        "minPasswordLength"
+      ]
+    }
+  },
+  "engine": {
+    "timeoutMs": 1500,
+    "joinGuardMs": 1100,
+    "_joinGuardNote": "AuthMe denyCommandsBeforeMilliseconds=1000 cancels AND kicks on any non-allowlisted command sent within 1000ms of PlayerJoinEvent. /login and /register are allowlisted and exempt. 1100 measured from PLAY, which is always later than the server's PlayerJoinEvent, so it is conservative.",
+    "retries": 0,
+    "_rateNote": "Chat-spam budget per bot. MEASURED on this server: +1 per command, -1 per second, kick above ~10. 20/s kicked after 10 commands, 2/s after 18, but 1/s and 0.5/s survived. So a burst is fine and a sustained 2/s is fatal - hence a token bucket, not a fixed gap.",
+    "burstCapacity": 8,
+    "refillPerSecond": 1
+  },
+  "fleet": {
+    "size": 7,
+    "connectStaggerMs": 1000,
+    "readyTimeoutMs": 20000,
+    "leaderIndex": 0,
+    "master": "PartyMaster",
+    "_masterNote": "Account name of the human party owner. The 'form party' console action invites every bot, then invites the master, waits masterAcceptWaitMs, then transfers leadership to the master.",
+    "masterAcceptWaitMs": 6000,
+    "rejoinOnKick": true,
+    "rejoinDelayMs": 3000,
+    "maxRejoinAttempts": 3,
+    "_rejoinNote": "A bot that is kicked waits rejoinDelayMs and reconnects up to maxRejoinAttempts times. Rejoining is suppressed during an intentional shutdown.",
+    "_staggerNote": "One second between connections, on request. AuthMe AntiBot flips at the 11th connection in a 5s window, so 7 bots at 1s apart is 7 connections over ~7s - comfortably inside.",
+    "progressiveParty": true,
+    "_progressiveNote": "When on, the first bot to reach READY invites each other bot the moment it becomes READY, so the party fills as the fleet arrives instead of waiting for all seven.",
+    "offlineWhenFull": true,
+    "offlineCommand": "off",
+    "_offlineNote": "Once every bot is in the party, each one runs the offlineCommand. A status, not a disconnect: the account stays connected, it is just standing down. Fires once per connect.",
+    "autoJoinOnInvite": true,
+    "allowLeaderFallback": false,
+    "_inviteNote": "Bot 1 (fleet.leaderIndex) creates the party and invites everyone. The other bots recognise the invite in chat by themselves and run the accept command with the inviter's name. allowLeaderFallback false means no other bot will stand in for bot 1 as the party owner - on a real server that would change what every later command means."
+  },
+  "commands": {
+    "_comment": "success/failure MUST be INSIDE each spec. Keys starting with _ are skipped by the loader, so do not put patterns there.",
+    "invite": {
+      "template": "/p inv {player}",
+      "timeoutMs": 1500,
+      "success": [
+        "mbpInviteSent"
+      ],
+      "failure": [
+        "mbpNotLeader",
+        "mbpAlreadyInParty",
+        "mbpAlreadyInvited",
+        "mbpNoPlayer"
+      ]
+    },
+    "accept": {
+      "template": "/p join {player}",
+      "timeoutMs": 1500,
+      "success": [
+        "mbpJoined"
+      ],
+      "failure": [
+        "mbpNotInParty",
+        "mbpNoInvite"
+      ],
+      "_note": "Default changed to /p join on request: the target BedWars server answers /p join <leader>, not /p accept. This is operator-editable, and the test bed's plugin is configured to match so the suite exercises the same shape."
+    },
+    "deny": {
+      "template": "/p deny {player}",
+      "timeoutMs": 1500,
+      "success": [
+        "mbpNotInParty"
+      ],
+      "failure": []
+    },
+    "leave": {
+      "template": "/p leave",
+      "timeoutMs": 1500,
+      "success": [
+        "mbpYouLeft"
+      ],
+      "failure": [
+        "mbpNotInParty",
+        "mbpNoInvite"
+      ]
+    },
+    "transfer": {
+      "template": "/p promote {player}",
+      "timeoutMs": 1500,
+      "success": [
+        "mbpTransferred"
+      ],
+      "failure": [
+        "mbpNotInParty",
+        "mbpNotLeader",
+        "mbpNoPlayer",
+        "mbpNoInvite"
+      ]
+    },
+    "kick": {
+      "template": "/p kick {player}",
+      "timeoutMs": 1500,
+      "success": [
+        "mbpKicked"
+      ],
+      "failure": [
+        "mbpNotInParty",
+        "mbpNotLeader",
+        "mbpNoPlayer",
+        "mbpNoInvite"
+      ]
+    },
+    "say": {
+      "template": "/pc {message}",
+      "timeoutMs": 1200,
+      "success": [
+        "partyChat"
+      ],
+      "failure": [
+        "notInParty"
+      ]
+    },
+    "disband": {
+      "template": "/p disband",
+      "timeoutMs": 1500,
+      "success": [
+        "mbpDisbanded"
+      ],
+      "failure": [
+        "mbpNotInParty",
+        "mbpNotLeader",
+        "mbpNoInvite"
+      ]
+    },
+    "promote": {
+      "template": "/p promote {player}",
+      "timeoutMs": 1500,
+      "success": [
+        "mbpPromoted"
+      ],
+      "failure": [
+        "mbpNotInParty",
+        "mbpNotLeader",
+        "mbpNoPlayer",
+        "mbpNoInvite"
+      ]
+    },
+    "chat": {
+      "template": "/pc {message}",
+      "timeoutMs": 1500,
+      "success": [],
+      "failure": [
+        "mbpNotInParty"
+      ]
+    },
+    "warp": {
+      "template": "/warp {warp}",
+      "timeoutMs": 2500,
+      "success": [],
+      "failure": []
+    },
+    "_warpNote": "Warp comes from a server plugin (Essentials and similar), not from the reference party plugin, so it has no default success pattern and will report FAILED on a server without that plugin. Edit the template to match your server.",
+    "off": {
+      "template": "/off",
+      "timeoutMs": 1500,
+      "success": [
+        "mbpOfflineSelf"
+      ],
+      "failure": [
+        "mbpNotInParty"
+      ]
+    }
+  },
+  "patterns": {
+    "_comment": "Operator overrides by name. A name that already exists REPLACES the shipped default in src/patterns.js; a NEW name ADDS a pattern. Leave this empty unless your server words things differently - the full default set lives in src/patterns.js and duplicating it here has already caused drift that silently reverted a bug fix."
+  },
+  "plan": [
+    {
+      "type": "auth",
+      "phase": "login"
+    },
+    {
+      "type": "barrier"
+    },
+    {
+      "type": "command",
+      "phase": "party",
+      "actor": "leader",
+      "action": "invite",
+      "target": "members",
+      "paceMs": 250
+    },
+    {
+      "type": "wait",
+      "ms": 400
+    },
+    {
+      "type": "command",
+      "phase": "party",
+      "actor": "members",
+      "action": "accept",
+      "target": "leader",
+      "paceMs": 250
+    }
+  ],
+  "report": {
+    "jsonl": "logs/results.jsonl",
+    "ringSize": 2000
+  },
+  "menu": {
+    "hotbarSlot": 5,
+    "row": 4,
+    "col": 4,
+    "button": "right",
+    "expectTitle": "",
+    "openTimeoutMs": 4000,
+    "settleMs": 1200,
+    "_comment": "Drives a chest-style menu: select this hotbar slot, right-click to open it, then click (row, col) inside the window. Row and column are 1-indexed the way a player counts them; the raw slot is (row-1)*9 + (col-1). button is right or left - a menu that only reacts to a real right-click needs 'right'. Set expectTitle to make a wrong menu a failure instead of a silent click into the unknown.",
+    "_verified": "Measured against PaperSpigot 1.8.8 with plugin/.../MenuSim.java: hotbar slot 5 + right-click opened a 54-slot chest, and a right window_click on slot 30 (row 4, col 4) was received as button=RIGHT right=true window=CHEST.",
+    "enabled": true,
+    "gateParty": true,
+    "retries": 1,
+    "_gateNote": "When enabled and gateParty is on, a bot must complete this menu flow before it will invite or accept anything. A bot that never reaches the area stays out of the party, and the dashboard shows it, instead of the party quietly forming with bots standing in the wrong place. Turn enabled off on a server that has no such menu."
+  },
+  "movement": {
+    "enabled": true,
+    "speed": 0.215,
+    "directionChangeMs": 900,
+    "tickMs": 50,
+    "_comment": "Random walk: one position packet per tick, heading re-rolled every directionChangeMs. speed is blocks per tick (a walking player is about 0.215, i.e. 4.3 blocks/second). It is not pathfinding - the bot wanders, it does not navigate. y always comes from the server, so a step or a fall is picked up from the server's correction rather than guessed.",
+    "_verified": "Measured on the live test server (test/move-probe.mjs): 160 position packets over 8s moved the bot 7.91 blocks as far as the SERVER reported, with 0 corrections and no kick."
+  },
+  "transport": "mineflayer",
+  "_transportNote": "'mineflayer' uses the full library: real 1.8 physics (measured to match vanilla to four decimals, acceleration ramp included), answer to transaction packets, and block placement. 'raw' is the original minecraft-protocol client: lighter, but measured against a real anti-cheat it is silent at the packets that separate a client from a bot, and it cannot place blocks.",
+  "bridge": {
+    "blocks": 8,
+    "yaw": 0,
+    "onObstacle": "stop",
+    "placeDelayMs": 250,
+    "stepTimeoutMs": 2500,
+    "maxStuckSteps": 2,
+    "_comment": "Sneak-bridge: hold sneak, walk in the yaw direction, place a block into the gap ahead of every step, release sneak when the bot can no longer move. yaw is 1.8 yaw - 0 faces +z (south), 90 faces -x (west). onObstacle: stop | back | up.",
+    "_verified": "bot.placeBlock verified on 1.8.9 against the live server: the target square was AIR before and WOOL after, confirmed by the server's own view of that coordinate."
+  },
+  "bedwars": {
+    "enabled": false,
+    "autoStart": true,
+    "startMessage": "",
+    "ironRequired": 16,
+    "collectTimeoutMs": 120000,
+    "walkTimeoutMs": 30000,
+    "maxIslands": 1,
+    "maxBridgeLength": 96,
+    "bridgeStepTimeoutMs": 3000,
+    "shop": {
+      "mode": "auto",
+      "maxDistance": 24,
+      "interactionDistance": 3,
+      "maxMenuDepth": 3,
+      "button": "left",
+      "openTimeoutMs": 4000,
+      "purchaseTimeoutMs": 4000
+    },
+    "geometry": {
+      "home": {
+        "id": "home",
+        "generator": null,
+        "bridgeStart": null
+      },
+      "islands": []
+    },
+    "_comment": "Configure generator and bridge geometry for the target BedWars map before enabling. In auto mode the bot locates nearby NPCs and reads their shop menus; shop name, location, title and wool slot are optional hints. Coordinates are block coordinates at the bot's feet. See BEDWARS.md."
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "mcbotctl",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Spawn N Minecraft 1.8.9 bots that form a party and report command success/failure",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "probe": "node src/probe.js"
+  },
+  "dependencies": {
+    "minecraft-protocol": "^1.68.0",
+    "mineflayer": "^4.39.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "mineflayer-pvp": "^1.3.2",
+    "prismarine-chat": "^1.13.0"
+  }
+}

@@ -1,0 +1,48 @@
+# McbotctlParty — the reference plugin used to test mcbotctl.
+#
+# IMPORTANT: both the SUBCOMMAND NAMES and the MESSAGES can be changed here.
+# The point is to prove mcbotctl's premise: rename everything on the server,
+# the bot still works, as long as the operator declares it correctly in the dashboard.
+# Change a few names and run the bot again -- it must still work.
+
+subcommands:
+  invite: inv
+  # Named 'join' to match the target BedWars server, whose command is /p join <leader>. The
+  # whole point of this plugin is that the names are configurable - this is that mechanism
+  # being used, not a hardcoded rename.
+  accept: join
+  deny: deny
+  leave: leave
+  disband: disband
+  transfer: transfer
+  promote: promote
+  list: list
+  chat: chat
+  kick: kick
+
+# {player} = the other player's name, {leader} = the leader's name, {size} = member count
+messages:
+  usage:            '&7[&5Party&7] &cUsage: /p <inv|accept|deny|leave|disband|transfer|promote|list|chat>'
+  noPlayer:         '&7[&5Party&7] &cThat player cannot be found'
+  selfInvite:       '&7[&5Party&7] &cYou cannot invite yourself.'
+  notLeader:        '&7[&5Party&7] &cYou are not the party leader.'
+  alreadyInParty:   '&7[&5Party&7] &cThe player {player} is already in a party.'
+  alreadyInvited:   '&7[&5Party&7] &cThe player {player} is already invited into your party.'
+  inviteSent:       '&7[&5Party&7] &a{player} was invited to your party.'
+  inviteReceived:   '&7[&5Party&7] &eYou were invited into {player}''s party! &7Go &f/p {sub} {player} &7to accept.'
+  noInvite:         '&7[&5Party&7] &cYou are not in a party and have no pending invite.'
+  joined:           '&7[&5Party&7] &aYou joined {leader}''s party!'
+  joinedBroadcast:  '&7[&5Party&7] &aThe player {player} joined the party.'
+  left:             '&7[&5Party&7] &aYou left your party.'
+  leftBroadcast:    '&7[&5Party&7] &eThe player {player} has left the party.'
+  disbanded:        '&7[&5Party&7] &cThe party has been disbanded.'
+  notInParty:       '&7[&5Party&7] &cYou are not in a party.'
+  notInSameParty:   '&7[&5Party&7] &cThat player is not in your party.'
+  transferred:      '&7[&5Party&7] &aThe new party leader is {player}'
+  promoted:         '&7[&5Party&7] &a{player} has been promoted.'
+  listHeader:       '&7[&5Party&7] &eParty ({size}):'
+  listEntry:        '&7 - &f{player}'
+  chatFormat:       '&9[Party] &f{player}&7: &f{message}'
+  kicked:           '&7[&5Party&7] &cThe player {player} has been removed from the party.'
+  offlineSelf:      '&7[&5Party&7] &7You are now marked &foffline&7 in the party.'
+  offlineParty:     '&7[&5Party&7] &7{player} is now &foffline&7.'
