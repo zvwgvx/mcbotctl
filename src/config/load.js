@@ -12,10 +12,15 @@ import { PATTERNS } from '../patterns.js'
 export const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 const DEFAULTS = {
-  server: { host: '127.0.0.1', port: 25566, version: '1.8.9', chatVersion: '1.8', checkTimeoutIntervalMs: 60000 },
+  server: {
+    host: '127.0.0.1', port: 25566, version: '1.8.9', chatVersion: '1.8',
+    checkTimeoutIntervalMs: 60000, connectTimeoutMs: 30000, disconnectGraceMs: 2000,
+    tcpKeepAliveInitialDelayMs: 30000, viewDistance: 'tiny', maxCatchupTicks: 1
+  },
   auth: { enabled: false, strategy: 'register-first', messageIntervalMs: 5000 },
   engine: { timeoutMs: 1500, joinGuardMs: 1100, retries: 0 },
   fleet: { size: 7, connectStaggerMs: 350, readyTimeoutMs: 20000, leaderIndex: 0 },
+  proxy: { file: 'config/proxies.json' },
   report: { jsonl: null, ringSize: 2000 },
   commands: {},
   patterns: {},
@@ -31,6 +36,7 @@ export function loadConfig (path = join(ROOT, 'config', 'default.json')) {
     auth: { ...DEFAULTS.auth, ...raw.auth },
     engine: { ...DEFAULTS.engine, ...(raw.engine ?? {}) },
     fleet: { ...DEFAULTS.fleet, ...raw.fleet },
+    proxy: { ...DEFAULTS.proxy, ...(raw.proxy ?? {}) },
     report: { ...DEFAULTS.report, ...raw.report }
   }
 
@@ -56,6 +62,9 @@ export function loadConfig (path = join(ROOT, 'config', 'default.json')) {
 
   const acctFile = raw.accounts?.file ?? 'accounts/accounts.txt'
   cfg.accountsFile = isAbsolute(acctFile) ? acctFile : join(ROOT, acctFile)
+  const proxyFile = cfg.proxy.file
+  if (typeof proxyFile !== 'string' || !proxyFile.trim()) throw new Error('proxy.file must be a non-empty path')
+  cfg.proxyFile = isAbsolute(proxyFile) ? proxyFile : join(ROOT, proxyFile)
   return cfg
 }
 

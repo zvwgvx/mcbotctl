@@ -29,10 +29,25 @@ export class AutoPartyBehaviour {
     this.busy = new Set()      // botIds with an invite/accept in flight
     this.done = new Set()      // botIds already brought into the party this session
     this.completed = false     // the fleet reached full party and stood down
-    this.invited = new Set()   // botIds bot 1 has already invited; the invite is durable
+    this.invited = new Map()   // botId -> last invitation evidence time
+    this.confirmedInvites = new Set()
     this.joining = new Set()   // botIds currently running their own join
+    this.attempts = new Map()  // botId -> bounded invitation attempts this connection
+    this.lastAttempt = new Map() // botId -> last invite command time, including unanswered ones
+    this.retryAfter = new Map()
+    this.inviteBusy = false
+    this.nextInviteAt = 0
+    this.partyListDone = new Set()
+    this.partyListTimers = new Map()
+    this.acceptInvite = null
+    this.retryTimer = null
+    this.retrySweepBusy = false
+    this.wrongPartyBusy = new Set()
     this.#warnedLeader = false
-    this.#sub(EV.BOT_READY, (e) => this.#onReady(e))
+    this.#sub(EV.BOT_READY, (e) => {
+      this.#onReady(e)
+      this.#schedulePartyList(e.botId, 2500)
+    })
   }
 
 // Handlers registered on the bus are NOT garbage collected when this object is dropped, and a
@@ -42,7 +57,17 @@ export class AutoPartyBehaviour {
   #warnedLeader = false
   #subs = []
   #sub (topic, fn) { this.#subs.push(this.bus.on(topic, fn)) }
-  dispose () { for (const off of this.#subs) { try { off() } catch {} } this.#subs = []; return this }
+  dispose () {
+    if (this.retryTimer) clearInterval(this.retryTimer)
+    this.retryTimer = null
+    for (const timer of this.partyListTimers.values()) clearTimeout(timer)
+    this.partyListTimers.clear()
+    this.acceptInvite = null
+    this.wrongPartyBusy.clear()
+    for (const off of this.#subs) { try { off() } catch {} }
+    this.#subs = []
+    return this
+  }
 
   attach (fleet) {
     this.fleet = fleet
@@ -51,7 +76,36 @@ export class AutoPartyBehaviour {
     // ran while every bot was still 'pending' at the gate, found nobody it was allowed to touch,
     // and never ran again — so the party never formed even though every bot did get through.
     // The gate opening is the event that matters, so it is listened to as well.
-    this.#sub('menu:state', (e) => { if (e.state === 'done') this.#onReady(e) })
+    this.#sub('menu:state', (e) => {
+      if (e.state !== 'done') return
+      this.#onReady(e)
+      this.#schedulePartyList(e.botId, 500)
+    })
+    this.#sub(EV.BOT_STATE, (e) => {
+      if (e.to !== 'DEAD') return
+      this.partyListDone.delete(e.botId)
+      clearTimeout(this.partyListTimers.get(e.botId))
+      this.partyListTimers.delete(e.botId)
+    })
+    // A sent invitation can be dropped or expire while the target is moving between lobbies.
+    // Sweep the missing members again, with #bring enforcing a finite retry budget and a
+    // settling window so one slow server response cannot produce a command storm.
+    this.retryTimer = setInterval(() => {
+      if (!this.enabled || !this.fleet || this.retrySweepBusy) return
+      this.retrySweepBusy = true
+      ;(async () => {
+        for (const bot of this.fleet.bots) {
+          if (this.#wrongParty(bot)) await this.#repairWrongParty(bot)
+        }
+        const inviter = this.#inviter()
+        if (!inviter) return
+        for (const member of this.fleet.bots) {
+          if (member !== inviter && this.#ready(member)) await this.#bring(inviter, member)
+        }
+      })().catch((err) => this.log.warn?.(`[party] retry sweep failed: ${err.message}`))
+        .finally(() => { this.retrySweepBusy = false })
+    }, Math.max(1000, Number(this.cfg.fleet?.partyRetrySweepMs ?? 5000)))
+    this.retryTimer.unref?.()
     return this
   }
 
@@ -59,6 +113,126 @@ export class AutoPartyBehaviour {
    *  from the menu behaviour. Without it the sweep would invite bots that are still standing in
    *  the lobby, and the party would look formed while half of it is somewhere else. */
   setGate (fn) { this.gate = fn; return this }
+
+  #canonicalLeader () {
+    const owner = this.fleet?.leader?.username
+    if (!owner) return null
+    const allowed = new Set([owner, this.cfg.fleet?.master].filter(Boolean).map((name) => String(name).toLowerCase()))
+    const observed = this.tracker?.entry(owner)
+    const seenLeader = observed?.leader ? String(observed.leader).toLowerCase() : null
+    if ((observed?.role === 'member' || observed?.role === 'leader') && seenLeader && allowed.has(seenLeader)) return seenLeader
+    return String(owner).toLowerCase()
+  }
+
+  #wrongParty (bot) {
+    if (!this.tracker || !bot) return false
+    const entry = this.tracker.entry(bot.username)
+    if (entry.role !== 'member' && entry.role !== 'leader') return false
+    if (!entry.leader) return false
+    const canonical = this.#canonicalLeader()
+    return !!canonical && String(entry.leader).toLowerCase() !== canonical
+  }
+
+  async #repairWrongParty (bot) {
+    if (!bot?.isReady() || !this.#wrongParty(bot) || this.wrongPartyBusy.has(bot.id)) return null
+    this.wrongPartyBusy.add(bot.id)
+    try {
+      const entry = this.tracker.entry(bot.username)
+      const action = entry.role === 'leader' && this.engine.get('disband') ? 'disband' : 'leave'
+      const result = await bot.run(action, {})
+      if (result.status === STATUS.OK || result.pattern === 'mbpNotInParty') {
+        this.done.delete(bot.id)
+        this.invited.delete(bot.id)
+        this.attempts.delete(bot.id)
+        this.lastAttempt.delete(bot.id)
+        this.retryAfter.delete(bot.id)
+        this.partyListDone.delete(bot.id)
+        this.log.info?.(`[party] ${bot.username} left a stray party and will rejoin ${this.fleet.leader?.username}`)
+      } else {
+        this.log.warn?.(`[party] ${bot.username} could not leave stray party: ${result.status} ${result.response ?? result.error ?? ''}`)
+      }
+      return result
+    } finally {
+      this.wrongPartyBusy.delete(bot.id)
+    }
+  }
+
+  isFull () {
+    if (!this.tracker || !this.fleet?.bots?.length) return false
+    const canonical = this.#canonicalLeader()
+    if (!canonical) return false
+    return this.fleet.bots.every((bot) => {
+      if (!bot.isReady()) return false
+      const entry = this.tracker.entry(bot.username)
+      return (entry.role === 'member' || entry.role === 'leader') &&
+        entry.leader && String(entry.leader).toLowerCase() === canonical
+    })
+  }
+
+  waitForFull (timeoutMs = 0) {
+    if (this.isFull()) return Promise.resolve({ size: this.fleet.bots.length })
+    return new Promise((resolve, reject) => {
+      let timeout = null
+      const finish = (error = null) => {
+        clearInterval(poll)
+        clearTimeout(timeout)
+        for (const off of offs) {
+          try { off() } catch {}
+        }
+        if (error) reject(error)
+        else resolve({ size: this.fleet.bots.length })
+      }
+      const check = () => {
+        const hold = this.fleet?.rejoinStatus?.()
+        if (hold?.blocked) {
+          finish(Object.assign(new Error(hold.label ?? 'fleet connection is held'), {
+            kind: 'blocked',
+            cause: hold.cause ?? 'fleet_hold'
+          }))
+          return
+        }
+        if (this.isFull()) finish()
+      }
+      const offs = [
+        this.bus.on('party:membership', check),
+        this.bus.on(EV.BOT_READY, check),
+        this.bus.on(EV.BOT_STATE, check),
+        this.bus.on(EV.FLEET_PHASE, check)
+      ]
+      const poll = setInterval(check, 500)
+      poll.unref?.()
+      const limit = Math.max(0, Number(timeoutMs))
+      if (limit > 0) {
+        timeout = setTimeout(() => finish(new Error(`party did not converge within ${limit}ms`)), limit)
+        timeout.unref?.()
+      }
+      check()
+    })
+  }
+
+  #schedulePartyList (botId, delay) {
+    if (!this.fleet || this.partyListDone.has(botId) || !this.engine.get('partyList')) return
+    clearTimeout(this.partyListTimers.get(botId))
+    const timer = setTimeout(() => {
+      this.partyListTimers.delete(botId)
+      const bot = this.fleet?.bots.find((b) => b.id === botId)
+      if (!bot?.isReady() || !this.#ready(bot) || this.partyListDone.has(botId)) return
+      this.partyListDone.add(botId)
+      bot.run('partyList', {}).then((result) => {
+        if (result.status !== STATUS.OK && result.pattern !== 'mbpNotInParty') {
+          this.log.info?.('[party] ' + bot.username + ' party status remains unconfirmed (' + result.status + ')')
+          this.partyListDone.delete(botId)
+          this.#schedulePartyList(botId, Math.max(1000, Number(this.cfg.fleet?.partyRetrySweepMs ?? 5000)))
+        }
+      }).catch((err) => {
+        this.log.warn?.('[party] ' + bot.username + ' party list failed: ' + err.message)
+        this.partyListDone.delete(botId)
+        this.#schedulePartyList(botId, Math.max(1000, Number(this.cfg.fleet?.partyRetrySweepMs ?? 5000)))
+      })
+    }, delay)
+    timer.unref?.()
+    this.partyListTimers.set(botId, timer)
+  }
 
   /** A member that SEES an invite joins by itself.
    *
@@ -82,7 +256,7 @@ export class AutoPartyBehaviour {
       // and reusing it here meant the member's own join was refused by the very invite that
       // prompted it: the gate opened, the held invite was found, and attemptJoin returned without
       // a word because the sweep still had the flag. Two different operations, two locks.
-      if (this.joining.has(bot.id) || this.done.has(bot.id)) return
+      if (this.joining.has(bot.id) || this.done.has(bot.id) || !bot.isReady()) return
       this.joining.add(bot.id)
       this.log.info?.(`[party] ${bot.username} was invited by ${inviter} - joining by itself`)
       bot.run('accept', { player: inviter })
@@ -90,12 +264,20 @@ export class AutoPartyBehaviour {
           if (r.status === STATUS.OK) {
             this.done.add(bot.id)
             pendingInvites.delete(bot.id)
+            this.confirmedInvites.delete(bot.id)
+          } else if (this.tracker?.entry(bot.username).role === 'none') {
+            // A failed /p join needs a fresh invitation. Keeping the old invite marker meant
+            // the missing member could remain outside the party for the whole session.
+            pendingInvites.delete(bot.id)
+            this.invited.delete(bot.id)
+            this.confirmedInvites.delete(bot.id)
           }
           this.log.info?.(`[party] ${bot.username} /p join ${inviter} -> ${r.status}${r.response ? ' :: ' + r.response : ''}`)
         })
         .catch((err) => this.log.warn?.(`[party] ${bot.username} could not join: ${err.message}`))
-        .finally(() => this.busy.delete(bot.id))
+        .finally(() => this.joining.delete(bot.id))
     }
+    this.acceptInvite = attemptJoin
 
     this.#sub(EV.MC_CHAT, (e) => {
       if (this.cfg.fleet?.autoJoinOnInvite === false) return
@@ -110,17 +292,32 @@ export class AutoPartyBehaviour {
       let m
       try { m = new RegExp(spec.re).exec(e.text) } catch { return }
       if (!m) return
-      const inviter = m.slice(1).find(Boolean)
+      const inviter = m.groups?.inviter ?? m.slice(1).find(Boolean)
       if (!inviter) return
+      // Pika also shows "X invited Y to the party" to other party members. Only Y may
+      // accept it; otherwise every bot that sees the broadcast sends /p join at once.
+      if (m.groups?.invitee && m.groups.invitee.toLowerCase() !== bot.username.toLowerCase()) return
       // Only invites from bot 1: a stranger's invite would put the bot in someone else's party,
       // where every later command means something different.
       if (leader && inviter.toLowerCase() !== leader.username.toLowerCase()) return
+      pendingInvites.set(bot.id, inviter)
+      this.invited.set(bot.id, Date.now())
       if (this.gate && !this.gate(bot)) {
-        pendingInvites.set(bot.id, inviter)
         this.log.info?.(`[party] ${bot.username} invited by ${inviter}, but it is still entering the area - the invite is held`)
         return
       }
-      attemptJoin(bot, inviter)
+      const delay = this.confirmedInvites.has(bot.id)
+        ? Math.max(0, Number(this.cfg.fleet?.partyAcceptDelayMs ?? 350))
+        : Math.max(0, Number(this.cfg.fleet?.partyAcceptUnconfirmedDelayMs ?? 1500))
+      const timer = setTimeout(() => attemptJoin(bot, inviter), delay)
+      timer.unref?.()
+    })
+
+    this.#sub(EV.BOT_STATE, (e) => {
+      if (e.to === 'DEAD') { pendingInvites.delete(e.botId); this.confirmedInvites.delete(e.botId) }
+    })
+    this.#sub('party:membership', (e) => {
+      if (e.role === 'member' || e.role === 'leader') { const id = this.#idOf(e.bot); pendingInvites.delete(id); this.confirmedInvites.delete(id) }
     })
 
     // The gate opening is the other half: an invite held while the bot was in the selector is
@@ -142,20 +339,35 @@ export class AutoPartyBehaviour {
   trackMembership (tracker) {
     this.tracker = tracker
     this.#sub('party:membership', (e) => {
+      const changedBot = this.fleet?.bots.find((bot) => bot.username === e.bot)
+      if (changedBot && this.#wrongParty(changedBot)) void this.#repairWrongParty(changedBot)
       if (e.role === 'none') {
-        this.done.delete(this.#idOf(e.bot))
-        // A party can come apart and re-form - a server restart, a disband, a kick, a reconnect.
-        // The stand-down belongs to a PARTY, not to the fleet's lifetime, so losing a member arms
-        // it again. Without this, one stand-down ever happened per dashboard process, and a party
-        // rebuilt after a server restart never stood down at all.
-        this.invited.delete(this.#idOf(e.bot))
+        const id = this.#idOf(e.bot)
+        const wasDone = this.done.has(id)
+        this.done.delete(id)
+        if (wasDone) {
+          this.invited.delete(id)
+          this.attempts.delete(id)
+          this.lastAttempt.delete(id)
+          this.retryAfter.delete(id)
+        }
         if (this.completed) {
           this.completed = false
           const b = this.fleet.bots.find((x) => x.username === e.bot)
           if (b) b.offline = false
         }
       }
-      if (e.role === 'member' || e.role === 'leader') this.done.add(this.#idOf(e.bot))
+      if (e.role === 'member' || e.role === 'leader') {
+        const expected = [this.fleet?.leader?.username, this.cfg.fleet?.master]
+          .filter(Boolean).map((name) => String(name).toLowerCase())
+        if (e.leader && expected.includes(String(e.leader).toLowerCase())) {
+          const id = this.#idOf(e.bot)
+          this.done.add(id)
+          this.attempts.delete(id)
+          this.lastAttempt.delete(id)
+          this.retryAfter.delete(id)
+        }
+      }
       // Membership is the only thing that can complete the party, so it is also the only place
       // the completion check needs to run.
       this.#maybeComplete().catch((err) => this.log.warn?.(`[party] stand-down failed: ${err.message}`))
@@ -166,9 +378,8 @@ export class AutoPartyBehaviour {
   /** Once every bot is in the party, the fleet stands down.
    *
    *  Fires ONCE per connect: /off is a status, and re-sending it on every membership event would
-   *  spam the party with the same line. Gated on the CONFIGURED fleet size, not on "every bot I
-   *  have", so a fleet smaller than the target does not stand down early just because it is as
-   *  full as it can get. */
+   *  spam the party with the same line. Require both the configured target and every bot in the
+   *  current roster: --bots may load fewer accounts, while the dashboard may rebuild with more. */
   async #maybeComplete () {
     if (this.completed) return null
     const f = this.cfg.fleet ?? {}
@@ -177,8 +388,13 @@ export class AutoPartyBehaviour {
     if (!this.engine.get(action)) return null
     if (!this.tracker) return null
 
-    const inParty = this.fleet.bots.filter((b) => this.tracker.entry(b.username).role !== 'none')
-    const need = Number(f.partySize ?? f.size ?? this.fleet.bots.length)
+    const canonical = this.#canonicalLeader()
+    const inParty = this.fleet.bots.filter((b) => {
+      const member = this.tracker.entry(b.username)
+      return canonical && (member.role === 'member' || member.role === 'leader') && member.leader &&
+        String(member.leader).toLowerCase() === canonical
+    })
+    const need = Math.max(Number(f.partySize ?? f.size) || 0, this.fleet.bots.length)
     if (inParty.length < need) return null
 
     this.completed = true
@@ -186,7 +402,7 @@ export class AutoPartyBehaviour {
     this.bus.emit('party:full', { size: inParty.length, action })
     const results = []
     for (const b of this.fleet.bots) {
-      if (!b.isReady()) continue
+      if (!b.isReady() || b.offline === true) continue
       const r = await b.run(action, {})
       results.push(r)
       // The bot's own claim, set only when the server acknowledged it.
@@ -198,7 +414,7 @@ export class AutoPartyBehaviour {
   }
 
   /** Called when the fleet is torn down or rebuilt, so a fresh fleet stands down again. */
-  resetCompletion () { this.completed = false; this.invited.clear(); this.joining.clear(); for (const b of this.fleet?.bots ?? []) b.offline = false }
+  resetCompletion () { this.completed = false; this.invited.clear(); this.confirmedInvites.clear(); this.joining.clear(); this.attempts.clear(); this.lastAttempt.clear(); this.retryAfter.clear(); this.inviteBusy = false; this.nextInviteAt = 0; this.partyListDone.clear(); this.wrongPartyBusy.clear(); for (const b of this.fleet?.bots ?? []) b.offline = false }
 
   #idOf (username) {
     const bot = this.fleet?.bots.find((b) => b.username === username)
@@ -207,7 +423,7 @@ export class AutoPartyBehaviour {
 
   get enabled () { return this.cfg.fleet?.progressiveParty !== false }
 
-  reset () { this.done.clear(); this.busy.clear(); this.invited.clear(); this.joining.clear() }
+  reset () { this.done.clear(); this.busy.clear(); this.invited.clear(); this.confirmedInvites.clear(); this.joining.clear(); this.attempts.clear(); this.lastAttempt.clear(); this.retryAfter.clear(); this.inviteBusy = false; this.nextInviteAt = 0; this.partyListDone.clear(); this.wrongPartyBusy.clear() }
 
   /** Which bot should issue the invites right now.
    *
@@ -219,7 +435,7 @@ export class AutoPartyBehaviour {
    *  Any ready bot can invite: it simply becomes the leader of the party it creates. That is a
    *  far better outcome than a fleet that cannot assemble because one account failed to log in. */
   #ready (bot) {
-    if (!bot?.isReady()) return false
+    if (!bot?.isReady() || this.#wrongParty(bot)) return false
     return this.gate ? this.gate(bot) : true
   }
 
@@ -274,23 +490,70 @@ export class AutoPartyBehaviour {
    *  change, so it reflects what the SERVER believes rather than what we asked for. A member that
    *  was invited but never joined stays out of `done`, and the party does not count as full. */
   async #bring (leader, member) {
-    if (member === leader || this.done.has(member.id) || this.invited.has(member.id) || this.busy.has(member.id)) return
+    if (member === leader || this.done.has(member.id) || this.busy.has(member.id) || this.inviteBusy || !this.#ready(leader) || !this.#ready(member)) return
+    const now = Date.now()
+    if (now < this.nextInviteAt) return
+    const lastInvite = this.invited.get(member.id)
+    if (lastInvite && now - lastInvite < 20000) return
+    const retryAfter = this.retryAfter.get(member.id) ?? 0
+    if (now < retryAfter) return
+    const lastAttempt = this.lastAttempt.get(member.id)
+    if (lastAttempt && now - lastAttempt < 8000) return
+    const maxAttempts = Math.max(0, Number(this.cfg.fleet?.partyInviteMaxAttempts ?? 0))
+    if (maxAttempts > 0 && (this.attempts.get(member.id) ?? 0) >= maxAttempts) return
     this.busy.add(member.id)
+    this.inviteBusy = true
+    const minGap = Math.max(0, Number(this.cfg.fleet?.partyInviteMinGapMs ?? 5000))
+    const noResponseGap = Math.max(minGap, Number(this.cfg.fleet?.partyInviteNoResponseCooldownMs ?? 15000))
+    let attempted = false
     try {
+      this.lastAttempt.set(member.id, Date.now())
+      this.attempts.set(member.id, (this.attempts.get(member.id) ?? 0) + 1)
       this.log.info?.(`[party] ${leader.username} >> invite ${member.username}`)
+      attempted = true
       const inv = await leader.run('invite', { player: member.username })
+      this.nextInviteAt = Date.now() + (inv.status === STATUS.NO_RESPONSE ? noResponseGap : minGap)
       if (inv.status === STATUS.OK) {
-        this.invited.add(member.id)
+        this.retryAfter.delete(member.id)
+        this.invited.set(member.id, Date.now())
+        this.confirmedInvites.add(member.id)
         this.log.info?.(`[party] invite sent to ${member.username} - waiting for it to join on its own`)
       } else if (inv.pattern === 'mbpAlreadyInvited') {
-        this.invited.add(member.id)
+        this.retryAfter.delete(member.id)
+        this.invited.set(member.id, Date.now())
+        this.confirmedInvites.add(member.id)
         this.log.info?.(`[party] ${member.username} is already holding a pending invite`)
       } else if (inv.pattern === 'mbpAlreadyInParty') {
+        this.retryAfter.delete(member.id)
         this.log.info?.(`[party] ${member.username} reports already being in a party`)
       } else {
-        this.log.warn?.(`[party] could not invite ${member.username}: ${inv.status} ${inv.response ?? inv.error ?? ''}`)
+        this.confirmedInvites.delete(member.id)
+        if (inv.status === STATUS.NO_RESPONSE) {
+          const attempt = this.attempts.get(member.id) ?? 1
+          const delay = Math.min(60000, 10000 * (2 ** Math.min(attempt - 1, 3)))
+          this.retryAfter.set(member.id, Date.now() + delay)
+          this.log.warn?.(`[party] could not invite ${member.username}: ${inv.status}; retrying after ${Math.round(delay / 1000)}s`)
+        } else {
+          this.log.warn?.(`[party] could not invite ${member.username}: ${inv.status} ${inv.response ?? inv.error ?? ''}`)
+        }
+      }
+      // Some networks omit the invite from the target's chat even while acknowledging it to
+      // the inviter. The normal chat path starts the join immediately; this fallback lets the
+      // same member accept after the server confirms the invite if no chat arrived.
+      if (inv.status === STATUS.OK || inv.status === STATUS.NO_RESPONSE || inv.pattern === 'mbpAlreadyInvited') {
+        const delay = (inv.status === STATUS.OK || inv.pattern === 'mbpAlreadyInvited')
+          ? Math.max(0, Number(this.cfg.fleet?.partyAcceptDelayMs ?? 350))
+          : Math.max(0, Number(this.cfg.fleet?.partyAcceptUnconfirmedDelayMs ?? 1500))
+        const timer = setTimeout(() => {
+          if (!this.done.has(member.id) && !this.joining.has(member.id) && this.#ready(member)) {
+            this.acceptInvite?.(member, leader.username)
+          }
+        }, delay)
+        timer.unref?.()
       }
     } finally {
+      if (attempted && this.nextInviteAt < Date.now() + minGap) this.nextInviteAt = Date.now() + minGap
+      this.inviteBusy = false
       this.busy.delete(member.id)
     }
   }

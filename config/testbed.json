@@ -52,7 +52,7 @@
   },
   "fleet": {
     "size": 7,
-    "connectStaggerMs": 1000,
+    "connectStaggerMs": 3500,
     "readyTimeoutMs": 20000,
     "leaderIndex": 0,
     "master": "PartyMaster",
@@ -60,7 +60,7 @@
     "masterAcceptWaitMs": 6000,
     "rejoinOnKick": true,
     "rejoinDelayMs": 3000,
-    "maxRejoinAttempts": 3,
+    "maxRejoinAttempts": 0,
     "_rejoinNote": "A bot that is kicked waits rejoinDelayMs and reconnects up to maxRejoinAttempts times. Rejoining is suppressed during an intentional shutdown.",
     "_staggerNote": "One second between connections, on request. AuthMe AntiBot flips at the 11th connection in a 5s window, so 7 bots at 1s apart is 7 connections over ~7s - comfortably inside.",
     "progressiveParty": true,
@@ -70,7 +70,17 @@
     "_offlineNote": "Once every bot is in the party, each one runs the offlineCommand. A status, not a disconnect: the account stays connected, it is just standing down. Fires once per connect.",
     "autoJoinOnInvite": true,
     "allowLeaderFallback": false,
-    "_inviteNote": "Bot 1 (fleet.leaderIndex) creates the party and invites everyone. The other bots recognise the invite in chat by themselves and run the accept command with the inviter's name. allowLeaderFallback false means no other bot will stand in for bot 1 as the party owner - on a real server that would change what every later command means."
+    "_inviteNote": "Bot 1 (fleet.leaderIndex) creates the party and invites everyone. The other bots recognise the invite in chat by themselves and run the accept command with the inviter's name. allowLeaderFallback false means no other bot will stand in for bot 1 as the party owner - on a real server that would change what every later command means.",
+    "connectMaxRounds": 0,
+    "connectRetryBaseMs": 1000,
+    "connectRetryMaxMs": 5000,
+    "partyInviteMaxAttempts": 0,
+    "partyRetrySweepMs": 1000,
+    "partyAcceptDelayMs": 350,
+    "partyAcceptUnconfirmedDelayMs": 1500,
+    "staleRxReconnectMs": 60000,
+    "staleRxTxRecentMs": 15000,
+    "staleRxRecoveryCooldownMs": 60000
   },
   "commands": {
     "_comment": "success/failure MUST be INSIDE each spec. Keys starting with _ are skipped by the loader, so do not put patterns there.",
@@ -203,6 +213,17 @@
       "failure": [
         "mbpNotInParty"
       ]
+    },
+    "partyList": {
+      "template": "/party list",
+      "timeoutMs": 5000,
+      "success": [
+        "partyHeader",
+        "partyOwnerLine"
+      ],
+      "failure": [
+        "mbpNotInParty"
+      ]
     }
   },
   "patterns": {
@@ -254,15 +275,25 @@
     "enabled": true,
     "gateParty": true,
     "retries": 1,
-    "_gateNote": "When enabled and gateParty is on, a bot must complete this menu flow before it will invite or accept anything. A bot that never reaches the area stays out of the party, and the dashboard shows it, instead of the party quietly forming with bots standing in the wrong place. Turn enabled off on a server that has no such menu."
+    "_gateNote": "When enabled and gateParty is on, a bot must complete this menu flow before it will invite or accept anything. A bot that never reaches the area stays out of the party, and the dashboard shows it, instead of the party quietly forming with bots standing in the wrong place. Turn enabled off on a server that has no such menu.",
+    "maxRecoveryAttempts": 0,
+    "recoveryBaseMs": 1000,
+    "recoveryMaxMs": 5000
   },
   "movement": {
     "enabled": true,
-    "speed": 0.215,
-    "directionChangeMs": 900,
+    "directionChangeMs": 1600,
     "tickMs": 50,
-    "_comment": "Random walk: one position packet per tick, heading re-rolled every directionChangeMs. speed is blocks per tick (a walking player is about 0.215, i.e. 4.3 blocks/second). It is not pathfinding - the bot wanders, it does not navigate. y always comes from the server, so a step or a fall is picked up from the server's correction rather than guessed.",
-    "_verified": "Measured on the live test server (test/move-probe.mjs): 160 position packets over 8s moved the bot 7.91 blocks as far as the SERVER reported, with 0 corrections and no kick."
+    "safetyScanMs": 150,
+    "lookAheadBlocks": 1,
+    "maxStepHeight": 0.6,
+    "sneakGuard": true,
+    "cautiousProbeMs": 250,
+    "headingAttempts": 8,
+    "fallLandingTimeoutMs": 5000,
+    "restartDelayMs": 750,
+    "_comment": "Continuous Mineflayer control loop for both lobby and match. It reads only loaded cells ahead, turns away from unsafe edges, pauses for native fall/knockback recovery, and then automatically resumes. No calculated position or velocity packets are emitted.",
+    "_verified": "Mineflayer physics owns all movement packets; this configuration provides only forward and view input."
   },
   "transport": "mineflayer",
   "_transportNote": "'mineflayer' uses the full library: real 1.8 physics (measured to match vanilla to four decimals, acceleration ramp included), answer to transaction packets, and block placement. 'raw' is the original minecraft-protocol client: lighter, but measured against a real anti-cheat it is silent at the packets that separate a client from a bot, and it cannot place blocks.",
@@ -278,10 +309,18 @@
   },
   "bedwars": {
     "enabled": false,
-    "autoStart": true,
+    "autoStart": false,
     "startMessage": "",
     "ironRequired": 16,
     "collectTimeoutMs": 120000,
+    "roam": {
+      "enabled": true,
+      "continuous": true,
+      "maxSessionMs": false,
+      "maxTurnRadians": 1.5708,
+      "maxSegments": 64,
+      "_comment": "The fixture has no fixed generator coordinate. In a confirmed match, autoplay keeps native Mineflayer movement active across loaded, supported floor while it observes generator evidence. It pauses only for safety recovery, unavailable chunks, cancellation, or match exit; maxSegments applies only if continuous is set false."
+    },
     "walkTimeoutMs": 30000,
     "maxIslands": 1,
     "maxBridgeLength": 96,
@@ -303,10 +342,32 @@
       },
       "islands": []
     },
-    "_comment": "Configure generator and bridge geometry for the target BedWars map before enabling. In auto mode the bot locates nearby NPCs and reads their shop menus; shop name, location, title and wool slot are optional hints. Coordinates are block coordinates at the bot's feet. See BEDWARS.md."
+    "_comment": "Configure safe bridge geometry for the target BedWars map before expecting a crossing. home.generator is optional: without it autoplay continuously explores only loaded, supported floor and confirms generator evidence before it routes or buys. In auto mode the bot locates nearby NPCs and reads their shop menus; shop name, location, title and wool slot are optional hints. Coordinates are block coordinates at the bot's feet. See BEDWARS.md.",
+    "presence": {
+      "requireMatch": false,
+      "joinMessage": "BEDWARS JOINED",
+      "titlePattern": "\\bbed[\\s_-]*wars?\\b"
+    }
   },
   "web": {
     "port": 4600,
     "host": "127.0.0.1"
+  },
+  "autoplay": {
+    "enabled": false,
+    "autoStart": false,
+    "matchDebounceMs": 1750,
+    "actionCooldownMs": 350,
+    "recoverDelayMs": 1000,
+    "maxActionFailures": 3,
+    "maxIslands": 1,
+    "minWool": 16,
+    "bridgeWoolBuffer": 2,
+    "combatWindowMs": 1000,
+    "cancelGraceMs": 5000,
+    "_comment": "Disabled for the continuous-movement profile. Generator, shop, bridge, and combat handoff tasks cannot claim movement controls."
+  },
+  "proxy": {
+    "file": "config/testbed-proxies.json"
   }
 }

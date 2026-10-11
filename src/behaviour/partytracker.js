@@ -22,28 +22,25 @@
 import { EV } from '../bus.js'
 import { PATTERNS } from '../patterns.js'
 
-const R = (key) => new RegExp(PATTERNS[key].re)
-const RE = {
-  joined: R('mbpJoined'),
-  joinedBroadcast: R('mbpJoinedBroadcast'),
-  youLeft: R('mbpYouLeft'),
-  leftBroadcast: R('mbpLeftBroadcast'),
-  kicked: R('mbpKicked'),
-  disbanded: R('mbpDisbanded'),
-  transferred: R('mbpTransferred'),
-  invited: R('mbpInviteReceived'),
-  alreadyIn: R('mbpAlreadyInParty'),
-  notInParty: R('mbpNotInParty'),
-  ownerLine: R('partyOwnerLine')
+const KEYS = {
+  joined: 'mbpJoined', joinedBroadcast: 'mbpJoinedBroadcast',
+  youLeft: 'mbpYouLeft', leftBroadcast: 'mbpLeftBroadcast', kicked: 'mbpKicked',
+  disbanded: 'mbpDisbanded', transferred: 'mbpTransferred', invited: 'partyInviteToMe',
+  alreadyIn: 'mbpAlreadyInParty', notInParty: 'mbpNotInParty', ownerLine: 'partyOwnerLine', membersLine: 'partyMembersLine'
 }
 
 export class PartyTracker {
   constructor ({ bus, log = console }) {
     this.bus = bus
     this.log = log
+    this.patternSources = null
+    this.patterns = null
     /** username -> { leader: string|null, role: 'leader'|'member'|'none', invitedBy: string|null } */
     this.members = new Map()
     this.#sub(EV.MC_CHAT, (e) => this.#onChat(e))
+    this.#sub(EV.MC_JOIN, (e) => {
+      if (e.bot) this.#set(e.bot, { leader: null, role: 'none', invitedBy: null, confirmedAbsent: null })
+    })
     // A bot that goes away leaves the party: the reference plugin removes it on quit, and so
     // does any plugin that cleans up after a disconnect.
     //
@@ -64,14 +61,29 @@ export class PartyTracker {
   #sub (topic, fn) { this.#subs.push(this.bus.on(topic, fn)) }
   dispose () { for (const off of this.#subs) { try { off() } catch {} } this.#subs = []; return this }
 
-  entry (name) { return this.members.get(name) ?? { leader: null, role: 'none', invitedBy: null } }
+  entry (name) { return this.members.get(name) ?? { leader: null, role: 'none', invitedBy: null, confirmedAbsent: null } }
+
+  #patterns () {
+    // loadConfig and dashboard edits can replace registry entries after this module is imported.
+    // Compile from the current registry, and refresh if an operator changes a pattern live.
+    const sources = Object.fromEntries(Object.entries(KEYS).map(([name, key]) => [name, PATTERNS[key]?.re ?? '(?!)']))
+    const signature = JSON.stringify(sources)
+    if (signature !== this.patternSources) {
+      this.patternSources = signature
+      this.patterns = Object.fromEntries(Object.entries(sources).map(([name, source]) => {
+        try { return [name, new RegExp(source)] } catch { return [name, new RegExp('(?!)')] }
+      }))
+    }
+    return this.patterns
+  }
 
   #set (name, patch) {
     if (!name) return
     const next = { ...this.entry(name), ...patch }
+    if (patch.role && !Object.hasOwn(patch, 'confirmedAbsent')) next.confirmedAbsent = patch.role === 'none'
     const prev = this.members.get(name)
     this.members.set(name, next)
-    if (!prev || prev.leader !== next.leader || prev.role !== next.role || prev.invitedBy !== next.invitedBy) {
+    if (!prev || prev.leader !== next.leader || prev.role !== next.role || prev.invitedBy !== next.invitedBy || prev.confirmedAbsent !== next.confirmedAbsent) {
       this.bus.emit('party:membership', { bot: name, ...next })
     }
   }
@@ -87,17 +99,21 @@ export class PartyTracker {
     const text = e.text
     const me = e.bot
     if (!text || !me) return
+    const RE = this.#patterns()
     let m
 
     if ((m = RE.joined.exec(text))) {
-      const leader = m.groups.leader
-      this.#set(me, { leader, role: 'member', invitedBy: null })
-      this.#set(leader, { leader, role: 'leader' })
+      if (m.groups?.leader) {
+        const leader = m.groups.leader
+        this.#set(me, { leader, role: 'member', invitedBy: null })
+        this.#set(leader, { leader, role: 'leader' })
+      } else if (m.groups?.joiner) {
+        this.#joinedBroadcast(me, m.groups.joiner)
+      }
       return
     }
     if ((m = RE.joinedBroadcast.exec(text))) {
-      const mine = this.entry(me).leader
-      if (mine) this.#set(m.groups.joiner, { leader: mine, role: 'member', invitedBy: null })
+      if (m.groups?.joiner) this.#joinedBroadcast(me, m.groups.joiner)
       return
     }
     // The party-status panel of a live BedWars server: "▏ Owner: <name>". It is printed TO the
@@ -105,14 +121,29 @@ export class PartyTracker {
     // this rule the tracker could not read that server at all and a bot that demonstrably had a
     // party still showed as 'not in party'.
     if ((m = RE.ownerLine.exec(text))) {
-      const owner = m.groups.leader
+      const owner = m.groups?.leader ?? m[1]
+      if (!owner) return
       this.#set(me, { leader: owner, role: owner === me ? 'leader' : 'member' })
       this.#set(owner, { leader: owner, role: 'leader' })
       return
     }
+    if ((m = RE.membersLine.exec(text))) {
+      const listStr = m.groups?.members ?? ''
+      if (!listStr) return
+
+      const leader = this.members.get(me)?.leader
+      const membersStr = listStr.split(',').map(s => s.trim().replace(/^(?:\([^)]+\)\s*)?/, '')).filter(Boolean)
+      if (leader) {
+        for (const name of membersStr) {
+          const role = name === leader ? 'leader' : 'member'
+          this.#set(name, { leader, role })
+        }
+      }
+      return
+    }
     if (RE.youLeft.test(text)) { this.#set(me, { leader: null, role: 'none', invitedBy: null }); return }
-    if ((m = RE.leftBroadcast.exec(text))) { this.#set(m.groups.leaver, { leader: null, role: 'none', invitedBy: null }); return }
-    if ((m = RE.kicked.exec(text))) { this.#set(m.groups.kicked, { leader: null, role: 'none', invitedBy: null }); return }
+    if ((m = RE.leftBroadcast.exec(text))) { this.#set(m.groups?.leaver ?? m[1], { leader: null, role: 'none', invitedBy: null }); return }
+    if ((m = RE.kicked.exec(text))) { this.#set(m.groups?.kicked ?? m[1], { leader: null, role: 'none', invitedBy: null }); return }
     if (RE.disbanded.test(text)) {
       const mine = this.entry(me).leader
       // Everyone who pointed at that leader is now out, including the leader itself.
@@ -122,26 +153,54 @@ export class PartyTracker {
     }
     if ((m = RE.transferred.exec(text))) {
       const mine = this.entry(me).leader
-      const next = m.groups.leader
+      const next = m.groups?.leader ?? m[1]
+      if (!next) return
       if (mine) for (const n of this.rosterOf(mine)) this.#set(n, { leader: next, role: n === next ? 'leader' : 'member' })
       this.#set(next, { leader: next, role: 'leader' })
       return
     }
-    if ((m = RE.invited.exec(text))) { this.#set(me, { invitedBy: m.groups.inviter }); return }
+    if ((m = RE.invited.exec(text))) {
+      // Some servers broadcast "X invited Y" to the whole party. Only Y holds the invite;
+      // treating every receiver as Y gives the tracker a false leader for other bots.
+      if (m.groups?.invitee && m.groups.invitee.toLowerCase() !== me.toLowerCase()) return
+      const inviter = m.groups?.inviter ?? m.slice(1).find(Boolean)
+      if (inviter) this.#set(me, { invitedBy: inviter })
+      return
+    }
     if ((m = RE.alreadyIn.exec(text))) {
-      // Told about a THIRD party, not ours: we know they are in one but not whose. The pattern
-      // captures the name positionally (no named group), and m.groups is undefined when a regex
-      // has no named groups at all - reading it would throw inside the bus handler.
-      const who = (m.groups && (m.groups.player ?? m.groups[1])) ?? m[1]
-      if (who) this.#set(who, {})
+      if (/\bYou are already in a party\b/i.test(text)) {
+        // Positive membership evidence, but the owner is not named. Keep partyJoined true while
+        // leaving the leader unknown until /party list or another server message identifies it.
+        this.#set(me, { leader: null, role: 'member', invitedBy: null })
+      } else if (/\bis already in your party\b/i.test(text)) {
+        const who = m.groups?.playerInYourParty ?? m[1]
+        const leader = this.entry(me).leader ?? me
+        if (who) this.#set(who, { leader, role: who === leader ? 'leader' : 'member' })
+      } else {
+        // The server only says that this player is in A party; it does not identify the owner.
+        const who = m.groups?.playerInParty ?? m[1]
+        if (who) this.#set(who, { leader: null, role: 'member' })
+      }
       return
     }
     if (RE.notInParty.test(text)) { this.#set(me, { leader: null, role: 'none', invitedBy: null }) }
   }
 
+  #joinedBroadcast (receiver, joiner) {
+    // This line is delivered to the party, including the joiner on some servers. The receiver
+    // is therefore positive membership evidence even when the server omits the owner name.
+    const prior = this.entry(receiver)
+    const leader = prior.leader ?? this.entry(joiner).invitedBy ?? null
+    if (receiver !== joiner && prior.role === 'none') {
+      this.#set(receiver, { leader, role: leader === receiver ? 'leader' : 'member' })
+    }
+    this.#set(joiner, { leader, role: leader === joiner ? 'leader' : 'member', invitedBy: null })
+    if (leader && leader !== joiner) this.#set(leader, { leader, role: 'leader' })
+  }
+
   snapshot () {
     const out = {}
-    for (const [name, m] of this.members) out[name] = { leader: m.leader, role: m.role, invitedBy: m.invitedBy }
+    for (const [name, m] of this.members) out[name] = { leader: m.leader, role: m.role, invitedBy: m.invitedBy, confirmedAbsent: m.confirmedAbsent }
     return out
   }
 }

@@ -95,6 +95,24 @@ node src/index.js --serve --port 4599
 | `--snapshot` | Print the full result tree as JSON |
 | `--quiet` | Less narration |
 
+### Direct bot commands
+
+Open **Bot Control** in the web console to send a command such as `/bedwars-2`.
+**Master Control** follows the current party leader until the configured botmaster has
+confirmed party membership, then switches to that account. An invitation by itself does not
+switch the target. The master account must be connected through this app's **Accounts** list
+to receive commands from the dashboard.
+
+**Individual Bot Control** sends only to the selected bot. Both controls show the exact target,
+the command, and replies captured after sending. A sent command with no captured reply is
+shown explicitly; later messages remain available in **Diagnostics**. Commands require a
+ready bot and share the existing per-bot command pacing. History is kept in the current page.
+
+**Leave All** sends the literal `/leave` command to every ready bot, including the master,
+and shows each bot's replies. Offline bots are skipped. Use it to exit the current game.
+The summary confirms commands sent; it does not infer
+that a match was left successfully from an absent reply.
+
 ## Test bed
 
 This repo ships the server it was developed against: PaperSpigot 1.8.8 with AuthMe, plus a

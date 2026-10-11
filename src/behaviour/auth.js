@@ -117,13 +117,18 @@ export class AuthBehaviour {
 
   #ready (state, generation, kind, r) {
     if (!this.#current(state, generation)) return r
+    const via = r.pattern === 'unknownCommand' ? 'not_required' : kind
     state.result = r
     state.bot.fsm.to(S.READY)
     this.bus.emit(EV.AUTH_OK, {
-      botId: state.bot.id, bot: state.bot.username, via: kind,
+      botId: state.bot.id, bot: state.bot.username, via,
       pattern: r.pattern, ms: Date.now() - (state.bot.joinedAt ?? Date.now())
     })
-    this.log.info?.(`[${state.bot.username}] authenticated via ${kind} at join+${Date.now() - state.bot.joinedAt}ms (${r.response ?? r.status})`)
+    if (via === 'not_required') {
+      this.log.info?.(`[${state.bot.username}] no auth command on this server; login is not required`)
+    } else {
+      this.log.info?.(`[${state.bot.username}] authenticated via ${kind} at join+${Date.now() - state.bot.joinedAt}ms (${r.response ?? r.status})`)
+    }
     return r
   }
 
@@ -166,6 +171,10 @@ export class AuthBehaviour {
     state.lastKind = kind
 
     if (kind === 'login' && r.status === STATUS.OK) return this.#ready(state, generation, kind, r)
+    if (r.pattern === "unknownCommand") {
+      this.log.info?.(`[${bot.username}] auth command is unknown on this server; login is not required`)
+      return this.#ready(state, generation, kind, r)
+    }
 
     // A wrong password is a HARD stop, not a retry: kickOnWrongPassword=true kicks on the
     // first bad attempt, and every attempt increments a counter that, with tempban enabled,

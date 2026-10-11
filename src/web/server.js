@@ -14,7 +14,6 @@ import { applyCommands } from '../config/load.js'
 import { parseAccounts, formatAccounts, generateAccounts } from '../accounts.js'
 import { defaultPartyPlan, masterPartyPlan } from '../behaviour/party.js'
 import { parseAddress } from '../runtime.js'
-import { openMenu } from '../menu.js'
 import { sneakBridge } from '../behaviour/bridge.js'
 
 const MIME = {
@@ -28,17 +27,55 @@ const MIME = {
 // Only forward the topics an operator can act on. Forwarding everything floods SSE with
 // per-tick noise and buries the lines that matter.
 const FORWARD = new Set([
-  EV.MC_CHAT, EV.MC_SENT, EV.MC_KICK, EV.MC_DISCONNECT, EV.MC_WARN, EV.MC_ERROR,
+  EV.MC_CHAT, EV.MC_SENT, EV.MC_KICK, EV.MC_DISCONNECT, EV.MC_END, EV.MC_WARN, EV.MC_ERROR,
   EV.CMD_RESULT, EV.BOT_STATE, EV.BOT_READY, EV.AUTH_OK, EV.AUTH_FAIL, EV.AUTH_PROMPT,
   EV.FLEET_PHASE, EV.FLEET_DONE, EV.BUS_ERROR,
   EV.MC_WINDOW_OPEN, EV.MC_WINDOW_CLOSE, 'menu:state', 'menu:result', 'party:full',
-  'bedwars:state'
+  'bedwars:state', 'combat:state', 'combat:attack', 'match:debug', EV.AUTOPLAY_STATE, EV.ACTION_LEASE
 ])
+
+// Keep the Bots card useful without copying an arbitrary server message (which can echo a
+// command or credential) into the state API. The unabridged transport event stays in Log.
+function disconnectSummary (event) {
+  const socket = event.socket ?? {}
+  // Do not expose the raw error text on the card: a server can echo a command there. It is only
+  // used for classification alongside the first TCP event observed by the session trace.
+  const evidence = [event.text, event.reason, event.error?.message, socket.errorCode, socket.errorMessage, socket.clientReason]
+    .filter((value) => value != null).join(' ').toLowerCase()
+  if (/\b(?:wrong|incorrect|invalid) password\b/.test(evidence)) return 'Incorrect login password'
+  if (/same username|already playing|duplicate login/.test(evidence)) return 'Account connected elsewhere'
+  if (/verify your connection|complete the verification process|v4g\.to/.test(evidence)) return 'Connection verification required'
+  if (/too many connections|throttl|anti.?bot/.test(evidence)) return 'Server connection limit'
+  if (/spam|too many packets|bad.?packets/.test(evidence)) return 'Server rejected packet rate'
+  if (/socks5/.test(evidence)) return 'SOCKS5 proxy connection failed'
+  if (/timed? out|timeout|keep.?alive/.test(evidence)) return 'Connection timed out'
+  if (/econnreset|connection reset|reset by peer/.test(evidence)) return 'Connection reset'
+  if (/bann?ed/.test(evidence)) return 'Account banned by server'
+  if (Array.isArray(socket.sequence) && socket.sequence.includes('transport:force-close')) {
+    return 'TCP close did not finish; socket was forcibly released'
+  }
+  if (socket.event === 'timeout') return 'TCP socket timed out'
+  if (socket.event === 'error') return socket.errorCode
+    ? `TCP socket error (${socket.errorCode})` : 'TCP socket error'
+  if (socket.event === 'end') return 'Remote TCP stream ended without a Minecraft kick message'
+  if (socket.event === 'close') return socket.hadError
+    ? 'TCP socket closed after a transport error'
+    : 'TCP socket closed without a Minecraft kick message'
+  if (/socketclosed|socket closed|connection closed|closed by/.test(evidence)) return 'Socket closed without a Minecraft kick reason'
+  return event.topic === EV.MC_KICK ? 'Kicked by server (see Log)' : 'Disconnected (see Log)'
+}
+
+function shouldReplaceDisconnectSummary (previous, next) {
+  // A reconnect failure such as "logging in too fast" must not hide an earlier server ban.
+  // MC_JOIN clears the record, so a later successful connection is still represented correctly.
+  return previous !== 'Account banned by server' || next === 'Account banned by server'
+}
 
 function mergeBedwars (base = {}, delta = {}) {
   return {
     ...base, ...delta,
     shop: delta.shop ? { ...(base.shop ?? {}), ...delta.shop } : base.shop,
+    presence: delta.presence ? { ...(base.presence ?? {}), ...delta.presence } : base.presence,
     geometry: delta.geometry ? {
       ...(base.geometry ?? {}), ...delta.geometry,
       home: delta.geometry.home
@@ -72,6 +109,8 @@ export class WebConsole {
     // AuthMe explicitly accepted /login. READY can also come from the quiet-prompt fallback or
     // from a server with authentication disabled.
     this.authByBot = new Map()
+    this.lastDisconnectByBot = new Map()
+    this.verificationByBot = new Map()
     app.bus.on('*', (e) => this.#push(e))
     // A party change can happen WITHOUT any HTTP request: the human master kicks someone in
     // game, a member types /p leave, or the server drops a bot mid-party. The tracker sees it on
@@ -93,17 +132,37 @@ export class WebConsole {
       pushState()
     })
     app.bus.on(EV.AUTH_OK, (e) => {
-      this.authByBot.set(e.botId, { state: e.via === 'quiet' ? 'assumed' : 'confirmed', via: e.via })
+      const state = e.via === 'quiet' ? 'assumed' : e.via === 'not_required' ? 'not_required' : 'confirmed'
+      this.authByBot.set(e.botId, { state, via: e.via })
       pushState()
     })
     app.bus.on(EV.AUTH_FAIL, (e) => {
       this.authByBot.set(e.botId, { state: 'failed', via: null })
       pushState()
     })
+    app.bus.on(EV.MC_JOIN, (e) => { this.lastDisconnectByBot.delete(e.botId); this.verificationByBot.delete(e.botId); pushState() })
+    for (const topic of [EV.MC_KICK, EV.MC_DISCONNECT, EV.MC_END]) {
+      app.bus.on(topic, (e) => {
+        const next = disconnectSummary(e)
+        const previous = this.lastDisconnectByBot.get(e.botId)
+        if (shouldReplaceDisconnectSummary(previous, next)) this.lastDisconnectByBot.set(e.botId, next)
+        const evidence = [e.text, e.reason, e.error?.message, e.socket?.errorMessage].filter(Boolean).join(' ')
+        const verification = evidence.match(/https:\/\/v4g\.to\/[A-Za-z0-9]+/i)?.[0] ?? null
+        if (verification) this.verificationByBot.set(e.botId, verification)
+        pushState()
+      })
+    }
+    app.bus.on(EV.FLEET_PHASE, pushState)
     app.bus.on('party:membership', pushState)
     app.bus.on('menu:state', pushState)
     app.bus.on('bedwars:state', pushState)
     app.bus.on('bedwars:presence', pushState)
+    // Motion updates arrive at most twice a second per bot. Refresh the state card through the
+    // existing 400 ms coalescer instead of forwarding each update as an individual SSE log line.
+    app.bus.on('movement:state', pushState)
+    app.bus.on('combat:state', pushState)
+    app.bus.on(EV.AUTOPLAY_STATE, pushState)
+    app.bus.on(EV.ACTION_LEASE, pushState)
   }
 
   get cfg () { return this.app.cfg }
@@ -131,6 +190,7 @@ export class WebConsole {
     if (!FORWARD.has(e.topic)) return
     const slim = { topic: e.topic, at: e.at, ...e }
     delete slim.seq
+    if (e.topic === EV.MC_ERROR && e.error instanceof Error) slim.error = { message: e.error.message }
     if (e.topic === EV.MC_CHAT && typeof slim.raw === 'string' && slim.raw.length > 400) {
       slim.raw = slim.raw.slice(0, 400) + '…'
     }
@@ -148,27 +208,50 @@ export class WebConsole {
 
   async #state () {
     const fleet = this.app.fleet
+    const botNames = fleet.bots.map((bot) => bot.username)
+    const proxy = this.app.proxyManager?.publicState(botNames) ?? {
+      mode: 'off', proxies: [], assignments: {}, routes: botNames.map((bot) => ({
+        bot, kind: 'direct', mode: 'off', proxyId: null, proxyName: null,
+        address: null, blocked: false, reason: null
+      }))
+    }
+    const rejoin = fleet.rejoinStatus?.() ?? {
+      enabled: !!this.cfg.fleet.rejoinOnKick, blocked: false, cause: null, label: null, detectedAt: null
+    }
     return {
       server: { host: this.cfg.server.host, port: this.cfg.server.port, version: this.cfg.server.version },
+      fleetCapacity: {
+        requested: Number(this.cfg.fleet?.requestedSize ?? fleet.size),
+        available: Number(this.cfg.fleet?.availableAccounts ?? fleet.size),
+        active: fleet.size
+      },
       master: this.cfg.fleet.master ?? '',
       rejoinOnKick: !!this.cfg.fleet.rejoinOnKick,
+      rejoin,
+      proxy,
       running: this.running,
       auth: { enabled: !!this.cfg.auth?.enabled, strategy: this.cfg.auth?.strategy, register: this.cfg.auth?.register?.enabled !== false },
       bedwars: { enabled: this.cfg.bedwars?.enabled === true, autoStart: this.cfg.bedwars?.autoStart !== false,
         actor: this.cfg.bedwars?.actor ?? fleet.leader?.username ?? null },
+      autoplay: {
+        enabled: this.cfg.autoplay?.enabled === true,
+        autoStart: this.cfg.autoplay?.autoStart === true
+      },
       bots: fleet.bots.map((b) => {
         const connected = b.transport?.connected === true && b.fsm.state !== S.DEAD
         const authRecord = this.authByBot.get(b.id)
         const authDetail = !connected ? (b.fsm.state === S.CONNECTING ? 'pending' : 'disconnected')
           : !this.cfg.auth?.enabled ? 'not_required'
-            : b.fsm.state === S.AUTH_FAILED || authRecord?.state === 'failed' ? 'failed'
-              : b.isReady() && authRecord?.state === 'confirmed' ? 'confirmed'
-                : b.isReady() && authRecord?.state === 'assumed' ? 'assumed'
-                  : 'pending'
+            : authRecord?.state === 'not_required' ? 'not_required'
+              : b.fsm.state === S.AUTH_FAILED || authRecord?.state === 'failed' ? 'failed'
+                : b.isReady() && authRecord?.state === 'confirmed' ? 'confirmed'
+                  : b.isReady() && authRecord?.state === 'assumed' ? 'assumed'
+                    : 'pending'
         const party = this.app.runtime.tracker?.entry(b.username) ?? { role: 'none', leader: null }
         const bedwarsPresence = this.app.runtime.bedwarsPresence?.stateOf(b.id)
         return {
           name: b.username,
+          proxy: b.proxyStatus?.() ?? proxy.routes.find((route) => route.bot === b.username) ?? null,
           state: b.fsm.state,
           ready: b.isReady(),
           protocol: b.protocolState,
@@ -180,7 +263,12 @@ export class WebConsole {
             bedwarsJoined: !connected ? false : bedwarsPresence?.joined ?? null,
             bedwarsStage: connected ? bedwarsPresence?.stage ?? null : null,
             bedwarsDetail: !connected ? 'disconnected' : bedwarsPresence?.detail ?? bedwarsPresence?.source ?? null,
-            partyJoined: connected && (party.role === 'leader' || party.role === 'member')
+            partyJoined: !connected ? false
+              : party.role === 'leader' || party.role === 'member' ? true
+                : party.confirmedAbsent === true ? false : null,
+            lastDisconnectReason: connected ? null : this.lastDisconnectByBot.get(b.id) ?? null,
+            verificationUrl: connected ? null : this.verificationByBot.get(b.id) ?? null,
+            fleetBlockReason: connected || !rejoin.blocked ? null : rejoin.label
           },
           // Colour contract for the dashboard: green = up and usable, yellow = on the way,
           // red = not in yet (either not started, or it failed and stopped trying).
@@ -189,7 +277,11 @@ export class WebConsole {
           // from the party, so the dashboard has to show why it is standing out.
           menu: this.app.runtime.menu?.stateOf(b.id) ?? { state: 'done', result: null },
           walking: !!this.app.runtime.movement?.isWalking(b.id),
+          movement: this.app.runtime.movement?.stateOf(b.id) ?? { state: 'disabled' },
           bedwars: this.app.runtime.bedwars?.stateOf(b.id) ?? { phase: 'idle' },
+          autoplay: this.app.runtime.autoplay?.stateOf(b.id) ?? { phase: 'off', task: null },
+          actionLease: this.app.runtime.supervisor?.activeOf(b.id) ?? null,
+          combat: this.app.runtime.combat?.stateOf(b.id) ?? { state: 'disabled', target: null, reason: null },
           offline: b.offline === true,
           phase: b.isReady() ? 'done'
             : (b.fsm.state === S.CONNECTING || b.fsm.state === S.PLAY || b.fsm.state === S.AUTH) ? 'waiting'
@@ -308,10 +400,99 @@ export class WebConsole {
           return this.#json(res, 200, { ok: true, stopped, bot: bot.username })
         }
         if (this.running) return this.#json(res, 409, { error: 'wait for the current fleet run to finish' })
+        await this.app.runtime.autoplay?.requestStop?.(bot, { source: 'opening sequence', disarm: true })
         const started = bedwars.start(bot)
         this.#broadcast('state', await this.#state())
         return this.#json(res, started.ok ? 202 : 409, started)
       }).catch((e) => this.#json(res, 500, { error: e.message }))
+    }
+
+    // The dashboard and the in-game `=play` command both call the same public autoplay API.
+    // Starting only arms a bot; the engine itself waits for positive match evidence before it
+    // obtains any movement or inventory controls.
+    if (req.method === 'POST' && p === '/api/autoplay') {
+      return this.#body(req).then(async (b) => {
+        if (!b || !['start', 'stop'].includes(b.action)) {
+          return this.#json(res, 400, { error: 'action must be start or stop' })
+        }
+        const autoplay = this.app.runtime.autoplay
+        if (!autoplay) return this.#json(res, 500, { error: 'autoplay is not wired' })
+        const requested = String(b.bot ?? 'all').trim()
+        const targets = !requested || requested.toLowerCase() === 'all'
+          ? this.app.fleet.bots
+          : this.app.fleet.bots.filter((bot) => bot.username.toLowerCase() === requested.toLowerCase())
+        if (!targets.length) return this.#json(res, 404, { error: `no such bot: ${requested}` })
+        const method = b.action === 'start' ? 'requestStart' : 'requestStop'
+        if (typeof autoplay[method] !== 'function') return this.#json(res, 500, { error: `autoplay does not provide ${method}` })
+        const results = []
+        for (const bot of targets) {
+          const result = await autoplay[method](bot, {
+            source: 'dashboard', ...(b.action === 'start' ? { arm: true, force: b.force === true } : { disarm: true })
+          })
+          results.push({ bot: bot.username, ...(result ?? { ok: false, error: 'empty autoplay response' }) })
+        }
+        this.#broadcast('state', await this.#state())
+        const accepted = results.filter((result) => result.ok).length
+        return this.#json(res, accepted ? 202 : 409, { ok: accepted === results.length, action: b.action, results })
+      }).catch((e) => this.#json(res, 500, { error: e.message }))
+    }
+
+    // ---- SOCKS5 proxy pool and per-bot routing ----
+    if (req.method === 'POST' && p === '/api/proxies') {
+      if (!this.app.proxyManager) return this.#json(res, 500, { error: 'proxy manager is not available' })
+      if (this.running) return this.#json(res, 409, { error: 'wait for the current fleet operation to finish' })
+      this.running = true
+      return this.#body(req).then(async (b) => {
+        if (!b) {
+          this.running = false
+          return this.#json(res, 400, { error: 'invalid JSON' })
+        }
+        if (typeof b.mode !== 'string' || !Array.isArray(b.proxies)) {
+          this.running = false
+          return this.#json(res, 400, { error: 'mode and proxies are required' })
+        }
+        const reconnect = b.reconnect === true
+        const rejoin = this.app.fleet.rejoinStatus?.()
+        if (reconnect && rejoin?.blocked) {
+          this.running = false
+          return this.#json(res, 409, { error: rejoin.label })
+        }
+
+        const botNames = this.app.fleet.bots.map((bot) => bot.username)
+        const proxy = await this.app.proxyManager.replace({
+          mode: b.mode,
+          proxies: b.proxies,
+          assignments: b.assignments
+        }, botNames)
+
+        if (!reconnect) {
+          this.running = false
+          this.#broadcast('state', await this.#state())
+          return this.#json(res, 200, { ok: true, proxy, reconnecting: false })
+        }
+
+        this.#broadcast('state', await this.#state())
+        const fleet = this.app.fleet
+        Promise.resolve().then(async () => {
+          await this.app.runtime.partyStatus?.prepareDisconnect(fleet.bots)
+          return fleet.reconnectAll()
+        })
+          .then((result) => this.#broadcast('connected', {
+            ready: result.ready.length,
+            total: fleet.size,
+            failed: result.failed,
+            proxy: true
+          }))
+          .catch((error) => this.#broadcast('runerror', { error: error.message }))
+          .finally(async () => {
+            this.running = false
+            this.#broadcast('state', await this.#state())
+          })
+        return this.#json(res, 202, { ok: true, proxy, reconnecting: true })
+      }).catch((error) => {
+        this.running = false
+        this.#json(res, 400, { error: error.message })
+      })
     }
 
     // ---- command templates + patterns ----
@@ -417,6 +598,8 @@ export class WebConsole {
         let rebuilt = false
         if (b.rebuild) {
           await this.app.rebuild(list)
+          this.lastDisconnectByBot.clear()
+          this.verificationByBot.clear()
           rebuilt = true
           this.log.info?.(`console: fleet rebuilt with ${list.length} account(s)`)
         }
@@ -427,6 +610,9 @@ export class WebConsole {
 
     // ---- connect every bot to an address, then register ----
     if (req.method === 'POST' && p === '/api/connect') {
+      const rejoin = this.app.fleet.rejoinStatus?.()
+      if (rejoin?.blocked && rejoin.cause === 'connection_verification') this.app.fleet.clearRejoinBlock?.('connection_verification')
+      else if (rejoin?.blocked) return this.#json(res, 409, { error: rejoin.label })
       // Claimed BEFORE the body is read. Checking after an await let two requests both observe
       // running === false, and both then drive reconnectAll() over the same bots.
       if (this.running) return this.#json(res, 409, { error: 'a run is in progress' })
@@ -434,6 +620,7 @@ export class WebConsole {
       return this.#body(req).then(async (b) => {
         if (!b) { this.running = false; return this.#json(res, 400, { error: 'invalid JSON' }) }
         let addr = null
+        let addressChanged = false
         if (b.address !== undefined) {
           try { addr = parseAddress(b.address) }
           catch (e) { this.running = false; return this.#json(res, 400, { error: e.message }) }
@@ -446,6 +633,8 @@ export class WebConsole {
               error: `"${b.address}" has no port. Write it as host:port — a bare host would be assumed to be 25565, which this tool refuses to use.`
             })
           }
+          addressChanged = String(this.cfg.server.host).toLowerCase() !== addr.host.toLowerCase() ||
+            Number(this.cfg.server.port) !== addr.port
           this.cfg.server.host = addr.host
           this.cfg.server.port = addr.port
           if (b.persist) await this.#saveConfig({ server: { host: this.cfg.server.host, port: this.cfg.server.port } })
@@ -453,8 +642,19 @@ export class WebConsole {
         }
         this.#broadcast('state', await this.#state())
         const fleet = this.app.fleet
-        Promise.resolve(fleet.reconnectAll())
-          .then((r) => this.#broadcast('connected', { ready: r.ready.length, total: fleet.size, failed: r.failed }))
+        // "Join server" is safe to press again for the current address. Only a real server
+        // switch needs to close healthy in-game sockets; bringOnline skips bots already up.
+        Promise.resolve().then(async () => {
+          let result
+          if (!addressChanged) result = await fleet.bringOnline()
+          else {
+            await this.app.runtime.partyStatus?.prepareDisconnect(fleet.bots)
+            result = await fleet.reconnectAll()
+          }
+          if (this.cfg.fleet?.progressiveParty !== false) await this.app.runtime.autoparty?.waitForFull()
+          return result
+        })
+          .then((r) => this.#broadcast('connected', { ready: r.ready.length, total: fleet.size, failed: r.failed, party: true }))
           .catch((e) => this.#broadcast('runerror', { error: e.message }))
           .finally(async () => { this.running = false; this.#broadcast('state', await this.#state()) })
         this.#json(res, 202, {
@@ -545,12 +745,24 @@ export class WebConsole {
           return this.#json(res, 200, { ok: failed.length === 0, joined: joining.length - failed.length, failed, results })
         }
 
-        // Special: the random walk toggle.
+        // Special: continuous background movement. Turning it on is an explicit profile change:
+        // stop/disarm old gameplay owners first instead of answering 409 and leaving a bot parked
+        // at a generator. The movement loop itself then waits behind any current menu/manual lease.
         if (b.action === 'walk') {
+          const rejoin = fleet.rejoinStatus?.()
+          if (b.enabled === true && rejoin?.blocked) return this.#json(res, 409, { error: rejoin.label })
           const mov = this.app.runtime.movement
           if (!mov) return this.#json(res, 500, { error: 'movement is not wired' })
-          if (b.enabled && fleet.bots.some((x) => this.app.runtime.bedwars.isRunning(x.id))) {
-            return this.#json(res, 409, { error: 'stop the BedWars opening before starting random walking' })
+          const stoppedAutoplay = []
+          const stoppedBedwars = []
+          if (b.enabled) {
+            for (const bot of fleet.bots) {
+              const result = await this.app.runtime.autoplay?.requestStop?.(bot, {
+                source: 'continuous movement enabled', disarm: true
+              })
+              if (result?.stopping || result?.phase === 'stopped') stoppedAutoplay.push(bot.username)
+              if (this.app.runtime.bedwars?.stop?.(bot, 'continuous movement enabled')) stoppedBedwars.push(bot.username)
+            }
           }
           if (b.enabled !== undefined) {
             if (!this.cfg.movement) this.cfg.movement = {}
@@ -564,17 +776,65 @@ export class WebConsole {
           }
           this.log.info?.(`console: walking ${mov.enabled ? 'enabled' : 'disabled'} (${changed.length} bot(s) changed)`)
           this.#broadcast('state', await this.#state())
-          return this.#json(res, 200, { ok: true, walking: mov.enabled, changed })
+          return this.#json(res, 200, { ok: true, walking: mov.enabled, changed, stoppedAutoplay, stoppedBedwars })
         }
 
         // Special: not a command, it drops the socket.
         if (b.action === 'disconnect') {
           const targets = b.bot === 'all' || !b.bot ? fleet.bots : fleet.bots.filter((x) => x.username === b.bot)
           if (!targets.length) return this.#json(res, 404, { error: `no such bot: ${b.bot}` })
+          await this.app.runtime.partyStatus?.prepareDisconnect(targets)
           for (const t of targets) t.stop('operator')
           this.log.info?.(`console: disconnected ${targets.length} bot(s)`)
           this.#broadcast('state', await this.#state())
           return this.#json(res, 200, { ok: true, disconnected: targets.map((t) => t.username) })
+        }
+
+        // p inv all: the first bot sends an invite to every other configured account.
+        // Keep this separate from invite-all, which also makes each member accept.
+        if (b.action === 'party-invite-all') {
+          const inviter = fleet.leader
+          if (!inviter?.isReady()) {
+            return this.#json(res, 409, { error: `${inviter?.username ?? 'bot 1'} is not READY` })
+          }
+          const members = fleet.bots.filter((bot) => bot !== inviter)
+          const invited = []
+          const alreadyIn = []
+          const alreadyInvited = []
+          const failed = []
+          for (const member of members) {
+            const result = await inviter.run('invite', { player: member.username })
+            if (result.pattern === 'mbpAlreadyInParty') {
+              const knownLeader = this.app.runtime.tracker?.entry(member.username).leader
+              if (knownLeader?.toLowerCase() === inviter.username.toLowerCase() || /\bis already in your party\b/i.test(result.response ?? '')) {
+                alreadyIn.push(member.username)
+              } else {
+                failed.push({
+                  bot: member.username,
+                  status: result.status,
+                  response: result.response ?? 'Already in a party; its owner is not confirmed'
+                })
+              }
+            }
+            else if (result.pattern === 'mbpAlreadyInvited') alreadyInvited.push(member.username)
+            else if (result.status === 'OK') invited.push(member.username)
+            else failed.push({
+              bot: member.username,
+              status: result.status,
+              response: result.response ?? result.error
+            })
+            await new Promise((resolve) => setTimeout(resolve, 250))
+          }
+          this.#broadcast('state', await this.#state())
+          return this.#json(res, 200, {
+            ok: failed.length === 0,
+            actor: inviter.username,
+            attempted: members.length,
+            invited,
+            alreadyIn,
+            alreadyInvited,
+            failed
+          })
         }
 
         // Special: the leader re-invites everyone in turn, then each accepts.
@@ -600,7 +860,19 @@ export class WebConsole {
             // in the party, so skipping the accept left them outside while the button reported ok.
             // The plugin's invites are durable, so that state persists until something accepts it.
             // Only the first is a no-op; the second still needs its accept.
-            if (inv.pattern === 'mbpAlreadyInParty') { alreadyIn.push(m.username); continue }
+            if (inv.pattern === 'mbpAlreadyInParty') {
+              const knownLeader = this.app.runtime.tracker?.entry(m.username).leader
+              if (knownLeader?.toLowerCase() === inviter.username.toLowerCase() || /\bis already in your party\b/i.test(inv.response ?? '')) {
+                alreadyIn.push(m.username)
+              } else {
+                failed.push({
+                  bot: m.username,
+                  status: inv.status,
+                  response: inv.response ?? 'Already in a party; its owner is not confirmed'
+                })
+              }
+              continue
+            }
             if (inv.status !== 'OK' && inv.pattern !== 'mbpAlreadyInvited') {
               failed.push({ bot: m.username, status: inv.status, response: inv.response ?? inv.error })
               continue
@@ -614,9 +886,30 @@ export class WebConsole {
           }
           this.#broadcast('state', await this.#state())
           return this.#json(res, 200, {
-            ok: failed.length === 0, invited: results.filter((r) => r.status === 'OK').length,
+            ok: failed.length === 0, invited: results.filter((r) => r.action === 'invite' && r.status === 'OK').length,
             alreadyIn, failed, results
           })
+        }
+
+        // Every ready bot without confirmed BedWars presence runs the selector flow.
+        if (b.action === 'join-bedwars-all') {
+          const results = []
+          for (const bot of ready) {
+            if (this.app.runtime.bedwarsPresence?.stateOf(bot.id)?.joined === true) {
+              results.push({ bot: bot.username, status: 'OK', note: 'already in BedWars lobby' })
+              continue
+            }
+            // Preserve an armed autoplay request: once the selector confirms the match, its
+            // menu-state event will let autoplay begin again under a fresh lease.
+            await this.app.runtime.autoplay?.requestStop?.(bot, { source: 'join BedWars selector', disarm: false })
+            const r = await this.app.runtime.menu.runForBot(bot, 0, {
+              owner: 'manual', priority: 'safety', preempt: true
+            })
+            results.push(r)
+            await new Promise((res) => setTimeout(res, 350))
+          }
+          this.#broadcast('state', await this.#state())
+          return this.#json(res, 200, { ok: true, results })
         }
 
         // The menu is not a chat command: it drives packets, so it takes its own path. It is
@@ -625,7 +918,10 @@ export class WebConsole {
           const who = b.bot ? fleet.bots.find((x) => x.username === b.bot) : (ready[0] ?? leader)
           if (!who) return this.#json(res, 409, { error: 'no bot is available' })
           if (this.app.runtime.bedwars.isRunning(who.id)) return this.#json(res, 409, { error: `${who.username} is running the BedWars opening` })
-          const result = await openMenu(who, this.cfg, this.log)
+          await this.app.runtime.autoplay?.requestStop?.(who, { source: 'manual menu', disarm: true })
+          const result = await this.app.runtime.menu.runForBot(who, 0, {
+            owner: 'manual', priority: 'safety', preempt: true, force: true
+          })
           this.#broadcast('state', await this.#state())
           return this.#json(res, result.status === 'OK' ? 200 : 409, { ok: result.status === 'OK', result })
         }
@@ -642,7 +938,29 @@ export class WebConsole {
             return this.#json(res, 400, { error: `onObstacle must be stop, back or up - got "${spec.onObstacle}"` })
           }
           if (b.persist) await this.#saveConfig({ bridge: { blocks: spec.blocks, yaw: spec.yaw, onObstacle: spec.onObstacle } })
-          const result = await sneakBridge(who, { bridge: spec }, this.log)
+          // A manual bridge has higher priority than autoplay. Disarm it first, then enter the
+          // same exclusive control lane that autoplay uses so a stale task cannot turn or move
+          // the bot while it is at a bridge edge.
+          await this.app.runtime.autoplay?.requestStop?.(who, { source: 'manual bridge', disarm: true })
+          const supervisor = this.app.runtime.supervisor
+          if (!supervisor) return this.#json(res, 500, { error: 'action supervisor is not wired' })
+          const result = await supervisor.run(who, {
+            owner: 'manual', action: 'bridge', priority: 'manual', blocksCombat: true,
+            timeoutMs: Math.min(120000, Math.max(15000, Number(spec.blocks ?? 8) * Number(spec.stepTimeoutMs ?? 2500) * 2))
+          }, async ({ signal, isCurrent, isOwner, cleanup }) => {
+            await this.app.runtime.movement?.stopAndWait?.(who)
+            if (!isCurrent()) return { status: 'CANCELLED', error: 'manual bridge was cancelled' }
+            const combat = this.app.runtime.combat
+            combat?.stop(who, 'manual bridge')
+            try {
+              return await sneakBridge(who, {
+                bridge: spec, signal, isCurrent, canCleanup: isOwner
+              }, this.log)
+            } finally {
+              cleanup()
+              if (isCurrent() && who.isReady()) combat?.start(who)
+            }
+          })
           this.#broadcast('state', await this.#state())
           return this.#json(res, result.status === 'OK' ? 200 : 409, { ok: result.status === 'OK', result })
         }
@@ -706,7 +1024,11 @@ export class WebConsole {
         this.running = true
         this.#broadcast('state', await this.#state())
         Promise.resolve()
-          .then(() => this.app.fleet.execute(plan))
+          .then(async () => {
+            await this.app.fleet.bringOnline()
+            if (this.cfg.fleet?.progressiveParty !== false) await this.app.runtime.autoparty?.waitForFull()
+            return this.app.fleet.execute(plan)
+          })
           .then((results) => {
             const bad = results.filter((r) => r.status !== 'OK')
             this.#broadcast('done', { total: results.length, bad: bad.length })

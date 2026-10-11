@@ -4,6 +4,7 @@
 
 import { stripLegacy } from '../util.js'
 import { walkToWaypoint } from './bedwars_navigation.js'
+import { nativeFallReason, nativePosition } from './motion_safety.js'
 
 const DEFAULT_SEARCH_DISTANCE = 24
 const DEFAULT_INTERACTION_DISTANCE = 3
@@ -53,7 +54,7 @@ export function findShopCandidates (bot, {
   maxDistance = DEFAULT_SEARCH_DISTANCE, nameHint = '', entityType = '', excludeIds = []
 } = {}) {
   const transport = bot?.transport
-  const me = transport?.pos ?? transport?.mc?.entity?.position
+  const me = nativePosition(transport)
   if (!transport?.connected || typeof transport.loadedEntities !== 'function' || !finitePosition(me)) return []
   const radius = Number.isFinite(Number(maxDistance)) && Number(maxDistance) > 0
     ? Number(maxDistance) : DEFAULT_SEARCH_DISTANCE
@@ -89,10 +90,18 @@ export function findShopCandidates (bot, {
   return candidates.sort((a, b) => b.score - a.score || a.distance - b.distance || Number(a.id) - Number(b.id))
 }
 
-function stopReason (bot, signal) {
+function currentLease (isCurrent) {
+  if (typeof isCurrent !== 'function') return true
+  try { return isCurrent() === true } catch { return false }
+}
+
+function stopReason (bot, signal, isCurrent) {
+  if (!currentLease(isCurrent)) return 'action lease is no longer current'
   if (signal?.aborted) return 'aborted'
   if (!bot?.transport?.connected) return 'transport disconnected'
   if (!bot?.isReady?.()) return `bot is ${bot?.fsm?.state ?? 'not READY'}`
+  const fall = nativeFallReason(bot.transport)
+  if (fall) return fall
   return null
 }
 
@@ -104,7 +113,8 @@ function safeCell (transport, x, y, z) {
 }
 
 function destinations (transport, entityPosition, interactionDistance) {
-  const me = transport.pos
+  const me = nativePosition(transport)
+  if (!me) return []
   const radius = Math.ceil(interactionDistance)
   const cx = Math.floor(entityPosition.x)
   const cz = Math.floor(entityPosition.z)
@@ -129,17 +139,18 @@ function destinations (transport, entityPosition, interactionDistance) {
  * bridging, jumping gaps and dropping, and is interrupted on abort or disconnect.
  */
 export async function approachShopCandidate (bot, candidate, {
-  signal, interactionDistance = DEFAULT_INTERACTION_DISTANCE, timeoutMs = DEFAULT_APPROACH_TIMEOUT_MS
+  signal, isCurrent, canCleanup, interactionDistance = DEFAULT_INTERACTION_DISTANCE, timeoutMs = DEFAULT_APPROACH_TIMEOUT_MS
 } = {}) {
   const at = Date.now()
   const transport = bot?.transport
   const base = { action: 'approachShopCandidate', bot: bot?.username, botId: bot?.id,
     candidateId: candidate?.id, candidateLabel: candidate?.label }
   const fail = (error) => ({ ...base, status: 'FAILED', error, latencyMs: Date.now() - at })
-  const stopped = stopReason(bot, signal)
+  const stopped = stopReason(bot, signal, isCurrent)
   if (stopped) return fail(stopped)
   if (!transport?.physics || typeof transport.resolveEntityCandidate !== 'function') return fail('shop NPC approach requires mineflayer transport')
-  if (!finitePosition(transport.pos)) return fail('bot position is unknown')
+  const startPosition = nativePosition(transport)
+  if (!finitePosition(startPosition)) return fail('bot position is unknown')
   const reach = Number(interactionDistance)
   if (!Number.isFinite(reach) || reach < 1.5 || reach > 4) return fail('interactionDistance must be between 1.5 and 4 blocks')
   const limit = Number(timeoutMs)
@@ -148,30 +159,36 @@ export async function approachShopCandidate (bot, candidate, {
 
   let live = transport.resolveEntityCandidate(candidate)
   if (!live || !finitePosition(live.position)) return fail('shop NPC is no longer loaded')
-  if (distance(transport.pos, live.position) > reach) {
+  if (distance(startPosition, live.position) > reach) {
     const cells = destinations(transport, live.position, reach)
     if (!cells.length) return fail('no observed safe floor within shop NPC reach')
     let lastError = 'no safe route to shop NPC'
     // Several safe endpoints can exist around an NPC. Try alternatives if a wall blocks one.
     for (const cell of cells) {
-      const reason = stopReason(bot, signal)
+      const reason = stopReason(bot, signal, isCurrent)
       if (reason) return fail(reason)
       const remaining = deadline - Date.now()
       if (remaining <= 0) break
-      const walked = await walkToWaypoint(bot, cell, { signal, timeoutMs: remaining })
+      const walked = await walkToWaypoint(bot, cell, { signal, timeoutMs: remaining, isCurrent, canCleanup })
       if (walked.status !== 'OK') { lastError = walked.error ?? lastError; continue }
       live = transport.resolveEntityCandidate(candidate)
       if (!live || !finitePosition(live.position)) return fail('shop NPC despawned during approach')
-      if (distance(transport.pos, live.position) <= reach) break
+      const position = nativePosition(transport)
+      if (!position) return fail('bot position is unknown')
+      if (distance(position, live.position) <= reach) break
       lastError = 'shop NPC moved out of reach'
     }
-    if (!live || distance(transport.pos, live.position) > reach) return fail(lastError)
+    const position = nativePosition(transport)
+    if (!position) return fail('bot position is unknown')
+    if (!live || distance(position, live.position) > reach) return fail(lastError)
   }
 
-  const reason = stopReason(bot, signal)
+  const reason = stopReason(bot, signal, isCurrent)
   if (reason) return fail(reason)
   live = transport.resolveEntityCandidate(candidate)
-  if (!live || distance(transport.pos, live.position) > reach) return fail('shop NPC is no longer in interaction range')
+  const position = nativePosition(transport)
+  if (!position) return fail('bot position is unknown')
+  if (!live || distance(position, live.position) > reach) return fail('shop NPC is no longer in interaction range')
   return { ...base, status: 'OK', entity: live, candidate,
-    distance: distance(transport.pos, live.position), latencyMs: Date.now() - at }
+    distance: distance(position, live.position), latencyMs: Date.now() - at }
 }

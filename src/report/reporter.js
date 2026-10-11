@@ -9,8 +9,10 @@ import { dirname } from 'node:path'
 import { EV } from '../bus.js'
 import { summarise } from '../engine/classify.js'
 
+const NETWORK_TOPICS = new Set([EV.MC_JOIN, EV.MC_KICK, EV.MC_DISCONNECT, EV.MC_END, EV.MC_ERROR, EV.BOT_STATE, 'bedwars:presence', 'network:health'])
+
 export class Reporter {
-  constructor ({ bus, log = console, jsonlPath = null, ringSize = 2000 }) {
+  constructor ({ bus, log = console, jsonlPath = null, networkJsonlPath = null, matchDebugJsonlPath = null, ringSize = 2000 }) {
     this.bus = bus
     this.log = log
     this.ringSize = ringSize
@@ -20,7 +22,11 @@ export class Reporter {
     this.startedAt = Date.now()
     this.subscribers = new Set()
     this.jsonlPath = jsonlPath
+    this.networkJsonlPath = networkJsonlPath
+    this.matchDebugJsonlPath = matchDebugJsonlPath
     if (jsonlPath) { try { mkdirSync(dirname(jsonlPath), { recursive: true }) } catch {} }
+    if (networkJsonlPath) { try { mkdirSync(dirname(networkJsonlPath), { recursive: true }) } catch {} }
+    if (matchDebugJsonlPath) { try { mkdirSync(dirname(matchDebugJsonlPath), { recursive: true }) } catch {} }
 
     bus.on('*', (e) => this.#onAny(e))
   }
@@ -29,6 +35,8 @@ export class Reporter {
     this.events.push({ seq: e.seq, at: e.at, topic: e.topic, bot: e.bot ?? null, summary: this.#summariseEvent(e) })
     if (this.events.length > this.ringSize) this.events.splice(0, this.events.length - this.ringSize)
     if (e.topic === EV.CMD_RESULT) this.#onResult(e)
+    if (this.networkJsonlPath && NETWORK_TOPICS.has(e.topic)) this.#onNetwork(e)
+    if (this.matchDebugJsonlPath && e.topic === 'match:debug') this.#onMatchDebug(e)
     for (const fn of this.subscribers) { try { fn(e) } catch { /* a slow UI must not break the run */ } }
   }
 
@@ -38,6 +46,18 @@ export class Reporter {
     if (this.jsonlPath) {
       try { appendFileSync(this.jsonlPath, JSON.stringify(r) + '\n') } catch { /* reporting must never be fatal */ }
     }
+  }
+
+  #onNetwork (e) {
+    const out = { ...e }
+    if (e.error instanceof Error) {
+      out.error = { message: e.error.message, code: e.error.code ?? null, name: e.error.name }
+    }
+    try { appendFileSync(this.networkJsonlPath, JSON.stringify(out) + '\n') } catch {}
+  }
+
+  #onMatchDebug (e) {
+    try { appendFileSync(this.matchDebugJsonlPath, JSON.stringify(e) + '\n') } catch {}
   }
 
   #summariseEvent (e) {

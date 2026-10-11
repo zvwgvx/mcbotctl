@@ -16,6 +16,7 @@ export const EV = Object.freeze({
   MC_SENT: 'mc:sent',            // a frame actually left the socket { text }
   MC_WARN: 'mc:warn',            // refused write (wrong protocol state) — the silent-0x00 guard
   MC_SCOREBOARD: 'mc:scoreboard', // visible sidebar snapshot { objective, title, lines, visible }
+  MC_TITLE: 'mc:title',            // title/subtitle/clear packet { action, text }
   // window / GUI
   MC_WINDOW_OPEN: 'mc:windowOpen',    // a chest-style window opened { windowId, title, slotCount, type }
   MC_WINDOW_CLOSE: 'mc:windowClose',  // { windowId }
@@ -34,6 +35,8 @@ export const EV = Object.freeze({
   // orchestration
   FLEET_PHASE: 'fleet:phase',
   FLEET_DONE: 'fleet:done',
+  ACTION_LEASE: 'action:lease', // per-bot owner of mutable gameplay controls
+  AUTOPLAY_STATE: 'autoplay:state',
   BUS_ERROR: 'bus:error'
 })
 

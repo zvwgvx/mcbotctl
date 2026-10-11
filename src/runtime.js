@@ -16,35 +16,103 @@ import { AuthBehaviour } from './behaviour/auth.js'
 import { PartyBehaviour } from './behaviour/party.js'
 import { AutoPartyBehaviour } from './behaviour/autoparty.js'
 import { PartyTracker } from './behaviour/partytracker.js'
+import { PartyStatusBehaviour } from './behaviour/party_status.js'
+import { MasterCommandsBehaviour } from './behaviour/master_commands.js'
 import { MenuBehaviour } from './behaviour/menu.js'
 import { Movement } from './behaviour/movement.js'
 import { BedWarsBehaviour } from './behaviour/bedwars.js'
+import { BedWarsPresence } from './behaviour/bedwars_presence.js'
+import { CombatBehaviour } from './behaviour/combat.js'
+import { StabilityMonitor } from './behaviour/stability_monitor.js'
+import { MatchDebugMonitor } from './behaviour/match_debug_monitor.js'
+import { AutoplayEngine } from './behaviour/autoplay_engine.js'
+import { ActionSupervisor } from './behaviour/action_supervisor.js'
 
-export function buildRuntime ({ bus, engine, cfg, roster, log = console }) {
-  const fleet = new Fleet({ cfg, accounts: roster, bus, engine, log })
+function nameOf (value) { return String(value ?? '').trim().toLowerCase() }
+
+function teamFor (mc, username) {
+  const wanted = nameOf(username)
+  if (!wanted) return null
+  for (const [name, team] of Object.entries(mc?.teamMap ?? {})) {
+    if (nameOf(name) === wanted) return team
+  }
+  return null
+}
+
+export function buildRuntime ({ bus, engine, cfg, roster, proxyManager = null, log = console }) {
+  proxyManager?.setBotNames(roster.map((account) => account.username))
+  const fleet = new Fleet({ cfg, accounts: roster, proxyManager, bus, engine, log })
   const auth = new AuthBehaviour({ cfg, bus, engine, log })
   const party = new PartyBehaviour({ bus, log })
   const tracker = new PartyTracker({ bus, log })
-  const menu = new MenuBehaviour({ cfg, bus, log })
-  const movement = new Movement({ cfg, bus, log })
+  const partyStatus = new PartyStatusBehaviour({ cfg, bus, engine, tracker, log })
+  const bedwarsPresence = new BedWarsPresence({ cfg, bus })
+  const supervisor = new ActionSupervisor({ cfg, bus, log })
+  const movement = new Movement({ cfg, bus, supervisor, log })
+  const menu = new MenuBehaviour({ cfg, bus, presence: bedwarsPresence, supervisor, movement, log })
+  menu.setRecoveryHandler((bot, reason) => fleet.recoverBot(bot, reason))
   const bedwars = new BedWarsBehaviour({ cfg, bus, menu, movement, log })
   const autoparty = new AutoPartyBehaviour({ cfg, bus, engine, log })
+  const combat = new CombatBehaviour({ cfg, bus, log })
+  const autoplay = new AutoplayEngine({ cfg, bus, supervisor, presence: bedwarsPresence, menu, bedwars, movement, combat, log })
+  const masterCommands = new MasterCommandsBehaviour({ cfg, bus, tracker, presence: bedwarsPresence, autoplay, log })
+  const stability = new StabilityMonitor({ cfg, bus, presence: bedwarsPresence, combat, log })
+  const matchDebug = new MatchDebugMonitor({ bus, presence: bedwarsPresence, tracker, log })
   for (const bot of fleet.bots) { auth.attach(bot); party.attach(bot); menu.attach(bot); movement.attach(bot) }
+  partyStatus.attach(fleet)
+  masterCommands.attach(fleet)
   autoparty.attach(fleet)
   bedwars.attach(fleet)
+  bedwarsPresence.attach(fleet)
+  supervisor.attach(fleet)
+  combat.attach(fleet)
+  stability.attach(fleet)
+  matchDebug.attach(fleet)
+  autoplay.attach(fleet)
   autoparty.trackMembership(tracker)
   // Members read the invite off the chat and join by themselves - they are not told to accept.
   autoparty.autoJoinInvites(cfg.patterns)
   // One gate, two readers: the engine refuses a party command from a bot that is not in the area,
   // and the arrival sweep never invites one. Both go through the same answer so they cannot
   // disagree about who is allowed to act.
-  engine.setGate((bot, spec) => (spec.auth ? null : menu.blockReason(bot)))
-  autoparty.setGate((bot) => menu.blockReason(bot) === null)
+  engine.setGate((bot, spec) => (spec.auth || spec.areaExempt ? null : menu.blockReason(bot)))
+  autoparty.setGate((bot) => menu.blockReason(bot) === null && partyStatus.blockReason(bot) === null)
+  // Combat stays inactive while an opening run owns movement controls. It also waits for
+  // positive match evidence by default, so lobby NPCs and players never become targets.
+  combat.setGate((bot) => {
+    const leaseReason = supervisor.combatBlockReason(bot)
+    if (leaseReason) return leaseReason
+    if (bedwars.isRunning(bot.id)) return 'BedWars opening is active'
+    if (cfg.combat?.requireBedWarsMatch !== false && bedwarsPresence.stateOf(bot.id).stage !== 'match') {
+      return 'waiting for BedWars match evidence'
+    }
+    return true
+  })
+  combat.setHostileFilter((bot, entity) => {
+    const target = nameOf(entity?.username)
+    if (!target) return false
+
+    // Party messages provide stronger friendly evidence than proximity. The tracker only
+    // returns members it has actually seen, so an unknown player is not silently treated as an ally.
+    const mine = tracker.entry(bot.username)
+    if (mine.leader && tracker.rosterOf(mine.leader).some((name) => nameOf(name) === target)) return false
+
+    // BedWars servers normally publish a scoreboard team for each player. Matching teams are
+    // allies; different teams are enemies. Some servers omit team packets, in which case the
+    // match gate still prevents lobby attacks and requireTeamEvidence can opt into stricter mode.
+    const mc = bot.transport?.mc
+    const mineTeam = teamFor(mc, bot.username)
+    const targetTeam = teamFor(mc, entity.username)
+    if (mineTeam && targetTeam) {
+      return mineTeam !== targetTeam && mineTeam.team !== targetTeam.team
+    }
+    return cfg.combat?.requireTeamEvidence !== true
+  })
   return {
-    fleet, auth, party, autoparty, tracker, menu, movement, bedwars,
+    fleet, auth, party, autoparty, tracker, partyStatus, masterCommands, menu, movement, bedwars, bedwarsPresence, combat, stability, matchDebug, supervisor, autoplay,
     dispose () {
-      auth.dispose(); party.dispose(); autoparty.dispose(); tracker.dispose()
-      menu.dispose(); movement.dispose(); bedwars.dispose(); autoparty.resetCompletion(); fleet.dispose()
+      auth.dispose(); party.dispose(); autoparty.dispose(); masterCommands.dispose(); partyStatus.dispose(); tracker.dispose()
+      menu.dispose(); autoplay.dispose(); void supervisor.dispose(); movement.dispose(); bedwars.dispose(); matchDebug.dispose(); stability.dispose(); bedwarsPresence.dispose(); combat.dispose(); autoparty.resetCompletion(); fleet.dispose()
     }
   }
 }

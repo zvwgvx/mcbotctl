@@ -3,251 +3,549 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>mcbotctl</title>
+<title>mcbotctl — Fleet Operations</title>
 <link rel="stylesheet" href="/glass.css">
 </head>
 <body>
 <div class="scene"><i></i><i></i><i></i><i></i></div>
 
 <div class="wrap">
-  <header class="glass" style="--radius:20px">
+  <header class="glass app-header">
     <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
     <div class="content row">
-      <div>
-        <h1>mcbotctl</h1>
-        <p class="sub" id="target">connecting…</p>
+      <div class="brand">
+        <div class="brand-mark">MC</div>
+        <div class="brand-copy">
+          <p class="eyebrow">Fleet control plane</p>
+          <h1>mcbotctl</h1>
+          <p class="sub" id="target">Loading fleet status…</p>
+        </div>
       </div>
-      <div class="row gap">
-        <span class="pill" id="conn">SSE: —</span>
-        <button id="btn-contrast" class="btn ghost" title="Turn the glass effect off for maximum text contrast">High contrast</button>
+      <div class="header-meta">
+        <span class="pill" id="conn">Live updates: —</span>
+        <button id="btn-contrast" class="btn ghost" title="Use a solid high-contrast surface">High Contrast</button>
       </div>
     </div>
   </header>
 
-  <nav class="tabs glass" style="--radius:16px">
+  <nav class="tabs glass">
     <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
     <div class="content row">
-      <button class="tab is-on" data-tab="server">Server</button>
+      <button class="tab is-on" data-tab="server">Overview</button>
       <button class="tab" data-tab="accounts">Accounts</button>
+      <button class="tab" data-tab="proxies">Proxies</button>
       <button class="tab" data-tab="party">Party</button>
+      <button class="tab" data-tab="control">Bot Control</button>
       <button class="tab" data-tab="commands">Commands</button>
-      <button class="tab" data-tab="log">Log</button>
+      <button class="tab" data-tab="log">Diagnostics</button>
       <span class="sub" id="tab-status"></span>
     </div>
   </nav>
 
-  <!-- ── Server ───────────────────────────────────────────────────── -->
+  <!-- ── Server ────────────────────────────────────────────────────────── -->
   <section class="panel" data-panel="server">
-    <div class="glass" style="--radius:20px">
-      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
-      <div class="content">
-        <h2>Test server</h2>
-        <p class="sub">Bots connect one second apart, send /register, then /login. Each bot card
-          shows connection, login, BedWars join and party join separately.</p>
-        <div class="field">
-          <input id="address" spellcheck="false" placeholder="127.0.0.1:25566">
-          <button id="btn-connect" class="btn primary">Join server</button>
-          <button id="btn-disconnect" class="btn ghost">Disconnect all</button>
-        </div>
-        <p class="sub" id="connect-msg"></p>
-        <div class="row wrap gap" style="justify-content:flex-start;margin-top:4px">
-          <button id="btn-walk" class="btn">Start walking</button>
-          <span class="sub">random W/A/S/D — the bots wander. Not pathfinding: they move, they do not navigate.</span>
-        </div>
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">System overview</p>
+        <h2>Fleet Operations</h2>
+        <p class="sub">Connection, BedWars presence, party membership, and automation state in one operational view.</p>
       </div>
     </div>
-    <div class="glass" style="--radius:20px">
-      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
-      <div class="content">
-        <h2>Bot squad <span class="sub" id="ready-count"></span><span class="sub" id="walk-count"></span></h2>
-        <p class="sub">✓ Confirmed · × Not done · ? Not confirmed · – Not required</p>
-        <div id="bots" class="bots"></div>
+
+    <div class="metrics" aria-label="Fleet summary">
+      <div class="metric">
+        <span class="metric-label">Operational</span>
+        <span class="metric-value" id="metric-operational">—</span>
+        <span class="metric-detail" id="metric-operational-detail">Fleet readiness</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">BedWars</span>
+        <span class="metric-value" id="metric-bedwars">—</span>
+        <span class="metric-detail" id="metric-bedwars-detail">Confirmed presence</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Party</span>
+        <span class="metric-value" id="metric-party">—</span>
+        <span class="metric-detail" id="metric-party-detail">Membership state</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Movement</span>
+        <span class="metric-value" id="metric-automation">—</span>
+        <span class="metric-detail" id="metric-automation-detail">Continuous roaming state</span>
       </div>
     </div>
-    <div class="glass" style="--radius:20px">
-      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
-      <div class="content">
-        <h2>BedWars opening</h2>
-        <p class="sub">The selected bot stands at the generator until it has 16 iron, buys wool,
-          then sneak bridges to a configured neighboring island. Set the map coordinates and shop
-          layout in <code>config/default.json</code> first.</p>
-        <div class="row wrap gap" style="justify-content:flex-start">
-          <button id="btn-bedwars-start" class="btn primary">Start BedWars opening</button>
-          <button id="btn-bedwars-stop" class="btn ghost">Stop</button>
-          <span class="sub" id="bedwars-state">idle</span>
+
+    <div class="overview-grid">
+      <div class="glass connection-card">
+        <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+        <div class="content">
+          <h2>Connection</h2>
+          <p class="sub">Target server and fleet transport controls.</p>
+          <div class="field">
+            <input id="address" spellcheck="false" placeholder="play.pika-network.net:25565">
+            <button id="btn-connect" class="btn primary">Connect Fleet</button>
+            <button id="btn-disconnect" class="btn ghost">Disconnect Fleet</button>
+          </div>
+          <p class="sub" id="connect-msg"></p>
+          <div class="row wrap gap" style="justify-content:flex-start;margin-top:4px">
+            <button id="btn-walk" class="btn">Resume Continuous Movement</button>
+            <span class="sub">Continuous movement starts automatically after each bot joins the lobby or a match.</span>
+          </div>
         </div>
-        <p class="sub" id="bedwars-msg"></p>
+      </div>
+
+      <div class="glass automation-card">
+        <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+        <div class="content">
+          <h2>Continuous Movement</h2>
+          <p class="sub">Every ready bot keeps moving in the lobby and in a match with Mineflayer’s native physics. It turns away from unloaded or unsupported ground, waits only for a safe recovery, and resumes automatically.</p>
+          <div class="row wrap gap" style="justify-content:flex-start">
+            <span class="pill" id="autoplay-state">Autoplay disabled</span>
+          </div>
+          <p class="sub" id="autoplay-msg">Autoplay, generator collection, shopping, and bridging are disabled in this profile so they cannot interrupt movement.</p>
+          <div class="row wrap gap" style="justify-content:flex-start;margin-top:10px">
+            <span class="pill" id="bedwars-state">BedWars opening disabled</span>
+          </div>
+          <p class="sub" id="bedwars-msg"></p>
+        </div>
+      </div>
+
+      <div class="glass fleet-card">
+        <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+        <div class="content">
+          <div class="row">
+            <div>
+              <h2>Fleet Status <span class="sub" id="ready-count"></span><span class="sub" id="walk-count"></span></h2>
+              <p class="sub">Server-confirmed state for every configured account.</p>
+            </div>
+            <span class="sub">✓ confirmed · × unavailable · ? unconfirmed · – not required</span>
+          </div>
+          <div id="bots" class="bots"></div>
+        </div>
       </div>
     </div>
   </section>
 
-  <!-- ── Accounts ─────────────────────────────────────────────────── -->
+  <!-- ── Accounts ──────────────────────────────────────────────────────── -->
   <section class="panel" data-panel="accounts" hidden>
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">Fleet configuration</p>
+        <h2>Accounts</h2>
+        <p class="sub">Manage the accounts used to build the fleet.</p>
+      </div>
+    </div>
     <div class="glass" style="--radius:20px">
       <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
       <div class="content">
-        <h2>Accounts <span class="sub" id="acc-count"></span></h2>
-        <p class="sub">One <code>username:password</code> per line. Names must be 3–16 characters of
-          <code>[A-Za-z0-9_]</code> — AuthMe disconnects shorter names at join and Minecraft caps the
-          length. Generate fills the box but does not save; save when you are happy with it.</p>
+        <h2>Account Roster <span class="sub" id="acc-count"></span></h2>
+        <p class="sub">Maintain the account roster used by the fleet. Use one <code>username:password</code>
+          entry per line. Generated accounts remain local to this form until saved.</p>
         <div class="field gen">
-          <label>count</label><input id="gen-count" type="number" min="1" max="200" value="7">
-          <label>prefix</label><input id="gen-prefix" value="Bot" spellcheck="false">
-          <label>password</label><input id="gen-pass" value="changeme123" spellcheck="false">
-          <button id="btn-gen" class="btn">Generate</button>
+          <label>Accounts</label><input id="gen-count" type="number" min="1" max="200" value="7">
+          <label>Username Prefix</label><input id="gen-prefix" value="Bot" spellcheck="false">
+          <label>Password</label><input id="gen-pass" value="changeme123" spellcheck="false">
+          <button id="btn-gen" class="btn">Generate Roster</button>
         </div>
         <textarea id="accounts" spellcheck="false" rows="12"></textarea>
         <div class="row gap" style="justify-content:flex-start;margin-top:10px">
-          <button id="btn-acc-save" class="btn primary">Save accounts</button>
-          <label class="chk"><input type="checkbox" id="acc-rebuild" checked> rebuild fleet</label>
-          <button id="btn-acc-disc" class="btn ghost">Disconnect</button>
+          <button id="btn-acc-save" class="btn primary">Save Roster</button>
+          <label class="chk"><input type="checkbox" id="acc-rebuild" checked> Rebuild fleet after save</label>
+          <button id="btn-acc-disc" class="btn ghost">Disconnect Fleet</button>
           <span class="sub" id="acc-msg"></span>
         </div>
       </div>
     </div>
   </section>
 
-  <!-- ── Party ────────────────────────────────────────────────────── -->
-  <section class="panel" data-panel="party" hidden>
-    <div class="glass" style="--radius:20px">
-      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
-      <div class="content">
-        <h2>Party</h2>
-        <p class="sub">Formation is automatic while the fleet joins: the first bot in invites each
-          other bot as it arrives. Use <b>Invite all</b> to redo it by hand.</p>
-        <div class="row wrap gap" style="justify-content:flex-start">
-          <button id="btn-run" class="btn primary">p inv ... (bot 1 invites all)</button>
-          <button id="btn-join-all" class="btn">p join ... (all bots join bot 1)</button>
-          <button id="btn-disband" class="btn">Disband</button>
-          <button id="btn-leave" class="btn">Leave (all)</button>
+  <!-- ── Proxies ──────────────────────────────────────────────────────── -->
+  <section class="panel" data-panel="proxies" hidden>
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">Network routing</p>
+        <h2>SOCKS5 Proxies</h2>
+        <p class="sub">Route bot connections through an evenly distributed pool or assign a proxy to each account.</p>
+      </div>
+      <span class="pill" id="proxy-summary">Direct connections</span>
+    </div>
+
+    <div class="proxy-layout">
+      <div class="glass proxy-pool-panel">
+        <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+        <div class="content">
+          <div class="row wrap gap">
+            <div>
+              <h2>Proxy Pool</h2>
+              <p class="sub">Credentials are stored locally and passwords are never returned to this page.</p>
+            </div>
+            <label class="proxy-mode-label">Routing mode
+              <select id="proxy-mode" class="sel">
+                <option value="off">Off — connect directly</option>
+                <option value="balanced">Balanced — fixed order (i % k)</option>
+                <option value="manual">Manual — assign per bot</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="proxy-import-box">
+            <label for="proxy-import" class="proxy-import-label">Import Proxy List</label>
+            <p class="sub" id="proxy-import-help">One proxy per line: <code>host:port:username:password</code> or <code>host:port</code> without authentication.</p>
+            <textarea id="proxy-import" rows="5" placeholder="198.51.100.10:1080:username:password&#10;198.51.100.11:1080:username:password" spellcheck="false" autocomplete="off" autocapitalize="off" aria-describedby="proxy-import-help"></textarea>
+            <div class="row wrap gap proxy-import-actions">
+              <button id="btn-proxy-import" class="btn" type="button">Import List</button>
+              <span class="sub" id="proxy-import-msg" aria-live="polite"></span>
+            </div>
+          </div>
+
+          <div id="proxy-list" class="proxy-list"></div>
+          <button id="btn-proxy-add" class="btn ghost" type="button">Add SOCKS5 Proxy</button>
+
+          <div class="row wrap gap proxy-actions">
+            <div class="row wrap gap" style="justify-content:flex-start">
+              <button id="btn-proxy-save" class="btn" type="button">Save Settings</button>
+              <button id="btn-proxy-apply" class="btn primary" type="button">Save &amp; Reconnect Fleet</button>
+            </div>
+            <span class="sub" id="proxy-msg" aria-live="polite"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="glass proxy-assignment-panel">
+        <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+        <div class="content">
+          <h2>Bot Routes</h2>
+          <p class="sub" id="proxy-assignment-help">Routes used for each bot's next connection.</p>
+          <div id="proxy-assignments" class="proxy-assignments"></div>
         </div>
       </div>
     </div>
+  </section>
 
-    <div class="glass" style="--radius:20px">
+  <!-- ── Party ────────────────────────────────────────────────────────── -->
+  <section class="panel" data-panel="party" hidden>
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">Coordination</p>
+        <h2>Party</h2>
+        <p class="sub">Assemble, synchronize, and inspect party state across the fleet.</p>
+      </div>
+    </div>
+    <div class="glass party-actions-panel">
       <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
       <div class="content">
-        <h2>Members</h2>
-        <p class="sub">Kick removes one member from the party. The leader does the kicking.</p>
+        <div class="row" style="margin-bottom:6px">
+          <h2>Party Operations</h2>
+          <div class="pill on" id="party-fleet-pill">Fleet Available</div>
+        </div>
+        <p class="sub">
+          Create, synchronize, and manage the active party across the connected fleet.
+        </p>
+
+        <div class="party-grid">
+          <!-- 0. Join BedWars Lobby -->
+          <button id="btn-join-bw-all" class="party-action-card highlight" title="Move every ready bot to the BedWars lobby through the configured server selector">
+            <div class="icon-wrap">
+              <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/></svg>
+            </div>
+            <div class="info">
+              <span class="title">Enter BedWars Lobby</span>
+              <span class="desc">Move every ready bot through the server selector</span>
+            </div>
+          </button>
+
+          <!-- 1. Auto Assemble -->
+          <button id="btn-run" class="party-action-card primary" title="Create a party and assemble all available fleet members">
+            <div class="icon-wrap">
+              <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            </div>
+            <div class="info">
+              <span class="title" id="btn-run-title">Assemble Party</span>
+              <span class="desc">Create the party and join available fleet members</span>
+            </div>
+          </button>
+
+          <!-- 2. Send Invites -->
+          <button id="btn-party-inv-all" class="party-action-card" title="Resend invitations to fleet members that are not yet in the party">
+            <div class="icon-wrap">
+              <svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+            </div>
+            <div class="info">
+              <span class="title">Resend Invitations</span>
+              <span class="desc">Invite missing fleet members again</span>
+            </div>
+          </button>
+
+          <!-- 3. Accept & Join -->
+          <button id="btn-join-all" class="party-action-card success" title="Ask ready bots to join the current fleet leader's party">
+            <div class="icon-wrap">
+              <svg viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+            </div>
+            <div class="info">
+              <span class="title">Join Leader Party</span>
+              <span class="desc">Accept pending party invitations for ready bots</span>
+            </div>
+          </button>
+
+          <!-- 4. Sync Party List -->
+          <button id="btn-party-list" class="party-action-card info-card" title="Refresh party membership from the server for every ready bot">
+            <div class="icon-wrap">
+              <svg viewBox="0 0 24 24"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
+            </div>
+            <div class="info">
+              <span class="title">Refresh Party State</span>
+              <span class="desc">Synchronize membership from the server</span>
+            </div>
+          </button>
+
+          <!-- 5. Disband Party -->
+          <button id="btn-disband" class="party-action-card danger" title="Disband the party currently owned by the fleet leader">
+            <div class="icon-wrap">
+              <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
+            </div>
+            <div class="info">
+              <span class="title">Disband Current Party</span>
+              <span class="desc">End the party controlled by the fleet leader</span>
+            </div>
+          </button>
+
+          <!-- 6. Leave Party -->
+          <button id="btn-leave" class="party-action-card danger" title="Remove every ready bot from its current party">
+            <div class="icon-wrap">
+              <svg viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+            </div>
+            <div class="info">
+              <span class="title">Leave Party — Fleet</span>
+              <span class="desc">Remove all ready bots from their current party</span>
+            </div>
+          </button>
+
+        </div>
+
+        <div id="party-feedback" class="party-feedback-box" style="display:none" aria-live="polite"></div>
+      </div>
+    </div>
+
+    <div class="glass party-members-panel">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>Party Members</h2>
+        <p class="sub">Review current membership and perform per-account party actions.</p>
         <div id="members" class="members"></div>
       </div>
     </div>
 
-    <div class="glass" style="--radius:20px">
+    <div class="glass party-master-panel">
       <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
       <div class="content">
-        <h2>Master</h2>
-        <p class="sub">The master is a real player, not one of the bots. Invite them, then hand over
-          leadership. <b>Form party with master</b> does the whole sequence in one go.</p>
+        <h2>Master Control</h2>
+        <p class="sub">Configure the human botmaster account used for party ownership and remote party-chat
+          control. The automated workflow can invite the master and transfer leadership after joining.</p>
         <div class="field">
-          <input id="master" spellcheck="false" placeholder="master account name">
-          <label class="chk"><input type="checkbox" id="promote" checked> promote</label>
+          <input id="master" spellcheck="false" placeholder="Botmaster username">
+          <label class="chk"><input type="checkbox" id="promote" checked> Promote after joining</label>
         </div>
         <div class="field">
-          <label class="lbl">wait for master</label>
+          <label class="lbl">Master join timeout</label>
           <input id="waitms" type="number" min="0" max="60000" step="500" value="6000" style="max-width:110px">
           <span class="sub">ms</span>
-          <button id="btn-save-master" class="btn ghost">Save master</button>
+          <button id="btn-save-master" class="btn ghost">Save Master Settings</button>
         </div>
         <div class="row wrap gap" style="justify-content:flex-start;margin-top:6px">
-          <button id="btn-master" class="btn primary">Form party with master</button>
-          <button id="btn-invite-master" class="btn">Invite master</button>
-          <button id="btn-transfer-master" class="btn">Transfer to master</button>
+          <button id="btn-master" class="btn primary">Assemble with Master</button>
+          <button id="btn-invite-master" class="btn">Invite Master</button>
+          <button id="btn-transfer-master" class="btn">Promote Master to Leader</button>
         </div>
         <p class="sub" id="master-msg"></p>
       </div>
     </div>
 
-    <div class="glass" style="--radius:20px">
+    <div class="glass party-selector-panel">
       <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
       <div class="content">
-        <h2>Menu</h2>
-        <p class="sub">Drives a chest-style GUI: select a hotbar slot, right-click to open the menu,
-          then click a slot inside it. Row and column are counted from 1, the way you count them on
-          screen. This uses real mouse clicks, not number keys.</p>
+        <h2>Server Selector Automation</h2>
+        <p class="sub">Configure the inventory menu flow used to enter BedWars. The automation selects the
+          configured hotbar item, opens the GUI, verifies the menu title when configured, and clicks the target slot.</p>
         <div class="field">
-          <label class="lbl">hotbar</label><input id="m-hotbar" type="number" min="1" max="9" value="5" style="max-width:64px">
-          <label class="lbl">row</label><input id="m-row" type="number" min="1" max="6" value="4" style="max-width:64px">
-          <label class="lbl">col</label><input id="m-col" type="number" min="1" max="9" value="4" style="max-width:64px">
-          <select id="m-button" class="sel"><option value="right">right click</option><option value="left">left click</option></select>
+          <label class="lbl">Hotbar Slot</label><input id="m-hotbar" type="number" min="1" max="9" value="5" style="max-width:64px">
+          <label class="lbl">Row</label><input id="m-row" type="number" min="1" max="6" value="4" style="max-width:64px">
+          <label class="lbl">Column</label><input id="m-col" type="number" min="1" max="9" value="4" style="max-width:64px">
+          <select id="m-button" class="sel"><option value="right">Right click</option><option value="left">Left click</option></select>
         </div>
         <div class="field">
-          <label class="lbl">title must contain</label>
-          <input id="m-title" spellcheck="false" placeholder="optional — catches the wrong menu">
+          <label class="lbl">Required Menu Title</label>
+          <input id="m-title" spellcheck="false" placeholder="Optional safety check">
         </div>
         <div class="row wrap gap" style="justify-content:flex-start;margin-top:6px">
-          <button id="btn-menu" class="btn primary">Open menu + click slot</button>
-          <button id="btn-menu-save" class="btn ghost">Save menu settings</button>
+          <button id="btn-menu" class="btn primary">Run Selector Flow</button>
+          <button id="btn-menu-save" class="btn ghost">Save Selector Settings</button>
         </div>
         <p class="sub" id="menu-msg"></p>
       </div>
     </div>
 
-    <div class="glass" style="--radius:20px">
+    <div class="glass party-bridge-panel">
       <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
       <div class="content">
-        <h2>Sneak bridge</h2>
-        <p class="sub">Holds sneak, walks in the chosen direction, and places a block into the gap
-          ahead of each step. Sneak is released when the bot can no longer move — the bridge is
-          done. Needs blocks in the inventory.</p>
+        <h2>Bridge Automation</h2>
+        <p class="sub">Run the configured sneak-bridge sequence using the selected heading and block budget.
+          The operation stops according to the configured obstacle policy.</p>
         <div class="field">
-          <label class="lbl">yaw</label><input id="b-yaw" type="number" value="0" style="max-width:80px">
-          <label class="lbl">blocks</label><input id="b-blocks" type="number" min="1" max="64" value="8" style="max-width:70px">
-          <label class="lbl">on obstacle</label>
+          <label class="lbl">Heading (Yaw)</label><input id="b-yaw" type="number" value="0" style="max-width:80px">
+          <label class="lbl">Block Limit</label><input id="b-blocks" type="number" min="1" max="64" value="8" style="max-width:70px">
+          <label class="lbl">Obstacle Policy</label>
           <select id="b-obstacle" class="sel">
-            <option value="stop">stop</option>
-            <option value="back">turn back</option>
-            <option value="up">go up</option>
+            <option value="stop">Stop</option>
+            <option value="back">Turn back</option>
+            <option value="up">Build upward</option>
           </select>
         </div>
         <div class="row wrap gap" style="justify-content:flex-start;margin-top:6px">
-          <button id="btn-bridge" class="btn primary">Sneak bridge</button>
-          <button id="btn-bridge-save" class="btn ghost">Save bridge settings</button>
+          <button id="btn-bridge" class="btn primary">Start Sneak Bridge</button>
+          <button id="btn-bridge-save" class="btn ghost">Save Bridge Settings</button>
         </div>
         <p class="sub" id="bridge-msg"></p>
       </div>
     </div>
 
-    <div class="glass" style="--radius:20px">
+    <div class="glass party-utility-panel">
       <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
       <div class="content">
-        <h2>Server actions</h2>
-        <p class="sub">Warp uses your server's own warp plugin, so edit the command on the Commands
-          tab if <code>/warp</code> is not what yours uses.</p>
+        <h2>Utility Actions</h2>
+        <p class="sub">Run server-specific utility commands. Command templates can be adjusted under
+          <b>Command Profiles</b>.</p>
         <div class="field">
-          <input id="warp-name" spellcheck="false" placeholder="warp name" value="spawn" style="max-width:200px">
-          <button id="btn-warp" class="btn">Warp (leader)</button>
-          <button id="btn-warp-all" class="btn">Warp (all)</button>
+          <input id="warp-name" spellcheck="false" placeholder="Warp destination" value="spawn" style="max-width:200px">
+          <button id="btn-warp" class="btn">Warp Leader</button>
+          <button id="btn-warp-all" class="btn">Warp Fleet</button>
         </div>
         <p class="sub" id="action-msg"></p>
       </div>
     </div>
   </section>
 
-  <!-- ── Commands ─────────────────────────────────────────────────── -->
+  <!-- ── Direct bot control ─────────────────────────────────────────────── -->
+  <section class="panel" data-panel="control" hidden>
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">Direct commands</p>
+        <h2>Bot Control</h2>
+        <p class="sub">Run a Minecraft command from the master or an individual bot and view that bot's replies.</p>
+      </div>
+    </div>
+    <div class="glass control-fleet">
+      <div class="content">
+        <div class="row control-fleet-action">
+          <div>
+            <h2>Leave All</h2>
+            <p class="sub">Send <code>/leave</code> to every ready bot, including the master. Offline bots are skipped.</p>
+          </div>
+          <button class="btn danger" id="control-leave-all" type="button" disabled>Leave all · /leave</button>
+        </div>
+        <p class="sub control-fleet-status" id="control-leave-all-status" role="status">Waiting for live fleet status…</p>
+        <details id="control-leave-all-results" hidden>
+          <summary>Per-bot results</summary>
+          <div class="control-fleet-result-list" id="control-leave-all-list"></div>
+        </details>
+      </div>
+    </div>
+    <div class="control-grid">
+      <div class="glass control-card">
+        <div class="frost"></div><div class="content">
+          <h2>Master Control</h2>
+          <div class="control-target" id="control-master-name">Waiting for party leader</div>
+          <span class="pill" id="control-master-role">No confirmed leader</span>
+          <p class="sub control-note" id="control-master-note">The current party leader acts as master until the configured botmaster joins.</p>
+          <form id="control-master-form">
+            <label class="lbl" for="control-master-command">Master command</label>
+            <div class="field control-command-field">
+              <input type="text" id="control-master-command" placeholder="/bedwars-2" autocomplete="off" spellcheck="false" required disabled>
+              <button class="btn primary" type="submit" id="control-master-send" disabled>Send command</button>
+            </div>
+          </form>
+          <p class="sub control-status" id="control-master-status" role="status">Waiting for live fleet status…</p>
+          <div class="row control-log-heading">
+            <h2>Command responses</h2>
+            <button class="btn ghost tiny" type="button" id="control-master-clear" disabled>Clear history</button>
+          </div>
+          <div class="control-log" id="control-master-log" role="log" aria-label="Master command responses" aria-live="polite"></div>
+        </div>
+      </div>
+      <div class="glass control-card">
+        <div class="frost"></div><div class="content">
+          <h2>Individual Bot Control</h2>
+          <label class="lbl" for="control-bot">Bot receiving the command</label>
+          <select class="sel control-picker" id="control-bot" disabled></select>
+          <p class="sub control-note">Choose one bot. Each bot keeps its own command history while this page stays open.</p>
+          <form id="control-individual-form">
+            <label class="lbl" for="control-individual-command">Bot command</label>
+            <div class="field control-command-field">
+              <input type="text" id="control-individual-command" placeholder="/bedwars-2" autocomplete="off" spellcheck="false" required disabled>
+              <button class="btn primary" type="submit" id="control-individual-send" disabled>Send command</button>
+            </div>
+          </form>
+          <p class="sub control-status" id="control-individual-status" role="status">Waiting for live fleet status…</p>
+          <div class="row control-log-heading">
+            <h2>Command responses</h2>
+            <button class="btn ghost tiny" type="button" id="control-individual-clear" disabled>Clear history</button>
+          </div>
+          <div class="control-log" id="control-individual-log" role="log" aria-label="Selected bot command responses" aria-live="polite"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Commands ──────────────────────────────────────────────────────── -->
   <section class="panel" data-panel="commands" hidden>
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">Protocol configuration</p>
+        <h2>Commands</h2>
+        <p class="sub">Edit command templates and verify how the server classifies their replies.</p>
+      </div>
+    </div>
     <div class="glass" style="--radius:20px">
       <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
       <div class="content">
-        <h2>Command config</h2>
-        <p class="sub">Type the real server command. <code>{player}</code> is the target,
-          <code>{message}</code> the body, <code>{warp}</code> the warp name. Press <b>Learn</b> to
-          make a bot send it and read the reply back.</p>
+        <h2>Command Profiles</h2>
+        <p class="sub">Maintain the command templates used by the automation engine. Variables such as
+          <code>{player}</code>, <code>{message}</code>, and <code>{warp}</code> are resolved at runtime.
+          Use <b>Probe Reply</b> to test a command against the live server response.</p>
         <div id="cmds"></div>
         <div class="row gap" style="justify-content:flex-start;margin-top:14px">
-          <button id="btn-save" class="btn primary">Save commands</button>
+          <button id="btn-save" class="btn primary">Save Command Profiles</button>
           <span class="sub" id="save-msg"></span>
         </div>
       </div>
     </div>
   </section>
 
-  <!-- ── Log ──────────────────────────────────────────────────────── -->
+  <!-- ── Log ──────────────────────────────────────────────────────────── -->
   <section class="panel" data-panel="log" hidden>
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">Observability</p>
+        <h2>Diagnostics</h2>
+        <p class="sub">Inspect match transitions, protocol events, command results, and runtime health.</p>
+      </div>
+    </div>
     <div class="glass" style="--radius:20px">
       <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
       <div class="content">
-        <h2>Live log <button id="btn-clear" class="btn ghost tiny">clear</button></h2>
+        <h2>Match Debug <button id="btn-debug-clear" class="btn ghost tiny">Clear Debug</button></h2>
+        <p class="sub">Dedicated match-transition telemetry. It compares BedWars presence detection with packet-level game/lobby fingerprints and captures the surrounding scoreboard, title, chat, position, party, keepalive and runtime health context.</p>
+        <div class="row gap debug-legend" style="justify-content:flex-start">
+          <span class="pill">game-like</span>
+          <span class="pill">lobby-like</span>
+          <span class="pill">detector mismatch</span>
+          <span class="sub">Persistent file: <code>logs/match-debug.jsonl</code></span>
+        </div>
+        <div id="match-debug" class="log debug-log"></div>
+      </div>
+    </div>
+    <div class="glass" style="--radius:20px">
+      <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
+      <div class="content">
+        <h2>Diagnostics Log <button id="btn-clear" class="btn ghost tiny">Clear Log</button></h2>
         <div id="log" class="log tall"></div>
       </div>
     </div>
@@ -259,17 +557,17 @@
     <div class="frost"></div><div class="bevel"></div><div class="spec"></div>
     <div class="content">
       <div class="row">
-        <h2>Learn from a real reply</h2>
-        <button id="learn-close" class="btn ghost">close</button>
+        <h2>Capture Server Reply</h2>
+        <button id="learn-close" class="btn ghost">Close</button>
       </div>
       <p class="sub" id="learn-head"></p>
       <div id="learn-lines" class="lines"></div>
-      <p class="sub">Pick a line as <b>success</b> or <b>failure</b> and a regex is generated for you.</p>
+      <p class="sub">Classify a server reply as <b>success</b> or <b>failure</b> to generate a matching response pattern.</p>
       <div id="learn-out" class="out"></div>
     </div>
   </div>
 </div>
 
-<script src="/app.js"></script>
+<script type="module" src="/app.js"></script>
 </body>
 </html>

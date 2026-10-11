@@ -4,12 +4,16 @@
 
 import pathfinderPackage from 'mineflayer-pathfinder'
 import { sleep } from '../util.js'
+import { nativeFallReason, nativePosition } from './motion_safety.js'
 
 const { Movements, goals } = pathfinderPackage
 const { GoalBlock } = goals
 const DEFAULT_WALK_TIMEOUT_MS = 15_000
 const DEFAULT_STEP_TIMEOUT_MS = 3_000
 const DEFAULT_MAX_BRIDGE_LENGTH = 96
+const PATHFINDER_TICK_BUDGET_MS = 12
+const WAYPOINT_SETTLE_TIMEOUT_MS = 750
+const WAYPOINT_SETTLED_HORIZONTAL_SPEED = 0.04
 
 function cell (point) {
   if (!point || !['x', 'y', 'z'].every((axis) => Number.isFinite(point[axis]))) return null
@@ -20,7 +24,7 @@ function sameCell (a, b) {
   return a?.x === b?.x && a?.y === b?.y && a?.z === b?.z
 }
 
-function currentCell (transport) { return cell(transport.pos) }
+function currentCell (transport) { return cell(nativePosition(transport)) }
 
 function nodes (geometry) {
   return [geometry?.home, ...(Array.isArray(geometry?.islands) ? geometry.islands : [])]
@@ -56,10 +60,23 @@ export function selectNeighborIsland (geometry, fromId = geometry?.home?.id, vis
     .sort((a, b) => distanceSquared(a.origin, a.point) - distanceSquared(b.origin, b.point) || a.target.id.localeCompare(b.target.id))[0]?.target ?? null
 }
 
-function reasonToStop (bot, signal) {
+function currentLease (isCurrent) {
+  if (typeof isCurrent !== 'function') return true
+  try { return isCurrent() === true } catch { return false }
+}
+
+function mayCleanup (canCleanup) {
+  if (typeof canCleanup !== 'function') return true
+  try { return canCleanup() === true } catch { return false }
+}
+
+function reasonToStop (bot, signal, isCurrent) {
+  if (!currentLease(isCurrent)) return 'action lease is no longer current'
   if (signal?.aborted) return 'cancelled'
   if (!bot?.transport?.connected) return 'connection lost'
   if (!bot.isReady?.()) return `bot is ${bot?.fsm?.state ?? 'not READY'}`
+  const fall = nativeFallReason(bot.transport)
+  if (fall) return fall
   return null
 }
 
@@ -67,8 +84,93 @@ function clearPathGoal (mc, goal) {
   if (mc?.pathfinder?.goal === goal) mc.pathfinder.setGoal(null)
 }
 
+/** Wait for Mineflayer's natural friction to settle after controls have been released. */
+async function waitForNativeSettle (bot, destination, { signal, timeoutMs, isCurrent }) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const stopped = reasonToStop(bot, signal, isCurrent)
+    if (stopped) throw new Error(stopped)
+    if (!sameCell(currentCell(bot.transport), destination)) {
+      throw new Error('bot drifted out of the waypoint while settling')
+    }
+    const entity = bot.transport?.mc?.entity
+    const velocity = entity?.velocity
+    const horizontalSpeed = Math.hypot(Number(velocity?.x), Number(velocity?.z))
+    // The native entity always has a Vec3 in Mineflayer. If a compatible transport does not
+    // expose it, grounded state is still safer than fabricating a velocity estimate.
+    if (entity?.onGround === true && (!Number.isFinite(horizontalSpeed) || horizontalSpeed <= WAYPOINT_SETTLED_HORIZONTAL_SPEED)) return
+    await sleep(50)
+  }
+  throw new Error('bot did not settle at the waypoint')
+}
+
+/**
+ * Pathfinder's convenient `goto()` completes its final node with internal `fullStop()`, which in
+ * v2.4 zeros horizontal velocity and may move the player x/z to a block centre. Install a
+ * prepended physics listener so, on the first tick that the live Mineflayer entity enters the
+ * requested cell, our goal is cleared before Pathfinder's own physics listener can finalize it.
+ * Clearing a goal resets key states; it does not write position or velocity.
+ */
+async function followGoalWithoutFullStop (bot, mc, goal, destination, { signal, timeoutMs, isCurrent, canCleanup }) {
+  let pathError = null
+  let reached = false
+  const previousTickTimeout = mc.pathfinder.tickTimeout
+  const configuredTickTimeout = Number(previousTickTimeout)
+  // Pathfinder defaults to 40ms of synchronous A* work per physics tick. Keep our short BedWars
+  // routes responsive by yielding well before the 50ms Mineflayer physics cadence, then restore
+  // the bot's prior setting when this exclusive route ends.
+  const tickBudget = Number.isFinite(configuredTickTimeout) && configuredTickTimeout > 0
+    ? Math.min(configuredTickTimeout, PATHFINDER_TICK_BUDGET_MS)
+    : PATHFINDER_TICK_BUDGET_MS
+  const onPathUpdate = (result) => {
+    if (mc.pathfinder.goal !== goal) return
+    if (result?.status === 'noPath') pathError = 'no path to waypoint'
+    else if (result?.status === 'timeout') pathError = 'pathfinder timed out while finding a waypoint route'
+  }
+  const onPhysicsTick = () => {
+    if (!currentLease(isCurrent)) return
+    if (mc.pathfinder.goal !== goal || !sameCell(currentCell(bot.transport), destination)) return
+    reached = true
+    clearPathGoal(mc, goal)
+  }
+  mc.on('path_update', onPathUpdate)
+  // Pathfinder subscribes with `on()` while the transport is built. `prependListener()` therefore
+  // runs after Mineflayer simulated the tick but before Pathfinder can call fullStop().
+  const listen = typeof mc.prependListener === 'function' ? 'prependListener' : 'on'
+  try {
+    mc.pathfinder.tickTimeout = tickBudget
+    mc[listen]('physicsTick', onPhysicsTick)
+    mc.pathfinder.setGoal(goal, true)
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const stopped = reasonToStop(bot, signal, isCurrent)
+      if (stopped) throw new Error(stopped)
+      if (pathError) throw new Error(pathError)
+      if (reached && sameCell(currentCell(bot.transport), destination)) {
+        const remaining = Math.max(0, deadline - Date.now())
+        await waitForNativeSettle(bot, destination, {
+          signal, timeoutMs: Math.min(WAYPOINT_SETTLE_TIMEOUT_MS, remaining), isCurrent
+        })
+        return
+      }
+      if (mc.pathfinder.goal !== goal) throw new Error('pathfinder goal was replaced')
+      await sleep(50)
+    }
+    throw new Error('waypoint timed out')
+  } finally {
+    mc.removeListener('path_update', onPathUpdate)
+    mc.removeListener('physicsTick', onPhysicsTick)
+    // A forced-release successor may already own this Mineflayer instance. Do not replace its
+    // pathfinder goal or tick budget from a delayed callback belonging to the old lease.
+    if (mayCleanup(canCleanup)) {
+      clearPathGoal(mc, goal)
+      mc.pathfinder.tickTimeout = previousTickTimeout
+    }
+  }
+}
+
 /** Walk on known solid floor only. Pathfinder cannot dig, place, sprint, jump gaps, or drop. */
-export async function walkToWaypoint (bot, point, { signal, timeoutMs = DEFAULT_WALK_TIMEOUT_MS } = {}) {
+export async function walkToWaypoint (bot, point, { signal, timeoutMs = DEFAULT_WALK_TIMEOUT_MS, isCurrent, canCleanup } = {}) {
   const startedAt = Date.now()
   const destination = cell(point)
   const base = { action: 'bedwarsWalk', bot: bot?.username, botId: bot?.id, destination }
@@ -78,7 +180,7 @@ export async function walkToWaypoint (bot, point, { signal, timeoutMs = DEFAULT_
   const transport = bot?.transport
   const mc = transport?.mc
   if (!transport?.physics || !mc?.pathfinder) return fail('walking needs the mineflayer physics transport')
-  const stopReason = reasonToStop(bot, signal)
+  const stopReason = reasonToStop(bot, signal, isCurrent)
   if (stopReason) return fail(stopReason)
 
   // Do not ask pathfinder to navigate to a point whose floor has not been observed. In BedWars an
@@ -89,15 +191,15 @@ export async function walkToWaypoint (bot, point, { signal, timeoutMs = DEFAULT_
   const loadDeadline = Date.now() + Math.min(timeoutMs, 10000)
   let floor, feet, head
   do {
-    const stopped = reasonToStop(bot, signal)
+    const stopped = reasonToStop(bot, signal, isCurrent)
     if (stopped) return fail(stopped)
     floor = transport.blockAt(destination.x, destination.y - 1, destination.z)
     feet = transport.blockAt(destination.x, destination.y, destination.z)
     head = transport.blockAt(destination.x, destination.y + 1, destination.z)
-    if (transport.pos && floor && feet && head) break
+    if (nativePosition(transport) && floor && feet && head) break
     await sleep(100)
   } while (Date.now() < loadDeadline)
-  if (!transport.pos) return fail('bot position is unknown')
+  if (!nativePosition(transport)) return fail('bot position is unknown')
   if (!floor) return fail('waypoint floor is not loaded')
   if (floor.boundingBox !== 'block') return fail('waypoint has no solid floor')
   if (!feet || !head) return fail('waypoint space is not loaded')
@@ -106,6 +208,8 @@ export async function walkToWaypoint (bot, point, { signal, timeoutMs = DEFAULT_
   if (sameCell(currentCell(transport), destination)) {
     return { ...base, status: 'OK', reached: true, latencyMs: Date.now() - startedAt }
   }
+
+  if (!currentLease(isCurrent)) return fail('action lease is no longer current')
 
   const movements = new Movements(mc)
   movements.canDig = false
@@ -120,31 +224,13 @@ export async function walkToWaypoint (bot, point, { signal, timeoutMs = DEFAULT_
   mc.pathfinder.setMovements(movements)
 
   const goal = new GoalBlock(destination.x, destination.y, destination.z)
-  let timer
-  let poll
-  let onAbort
   try {
-    const interruption = new Promise((_, reject) => {
-      onAbort = () => { clearPathGoal(mc, goal); reject(new Error('cancelled')) }
-      signal?.addEventListener('abort', onAbort, { once: true })
-      timer = setTimeout(() => { clearPathGoal(mc, goal); reject(new Error('waypoint timed out')) }, timeoutMs)
-      poll = setInterval(() => {
-        const stopped = reasonToStop(bot, signal)
-        if (stopped) { clearPathGoal(mc, goal); reject(new Error(stopped)) }
-      }, 100)
-    })
-    const walking = mc.pathfinder.goto(goal)
-    if (signal?.aborted) onAbort()
-    await Promise.race([walking, interruption])
+    await followGoalWithoutFullStop(bot, mc, goal, destination, { signal, timeoutMs, isCurrent, canCleanup })
     if (!sameCell(currentCell(transport), destination)) return fail('pathfinder stopped before the waypoint')
     return { ...base, status: 'OK', reached: true, latencyMs: Date.now() - startedAt }
   } catch (error) {
-    clearPathGoal(mc, goal)
+    if (mayCleanup(canCleanup)) clearPathGoal(mc, goal)
     return fail(error.message)
-  } finally {
-    clearTimeout(timer)
-    clearInterval(poll)
-    signal?.removeEventListener('abort', onAbort)
   }
 }
 
@@ -197,11 +283,14 @@ async function equipWool (transport) {
   try { await transport.mc.equip(item, 'hand'); return item } catch { return null }
 }
 
-async function waitForSolidFloor (transport, position, signal) {
+async function waitForSolidFloor (transport, position, signal, isCurrent) {
   const until = Date.now() + 1000
   do {
+    if (!currentLease(isCurrent)) throw new Error('action lease is no longer current')
     if (signal?.aborted) throw new Error('cancelled')
     if (!transport.connected) throw new Error('connection lost')
+    const fall = nativeFallReason(transport)
+    if (fall) throw new Error(fall)
     const block = transport.blockAt(position.x, position.y - 1, position.z)
     if (block?.boundingBox === 'block') return true
     await sleep(50)
@@ -209,9 +298,10 @@ async function waitForSolidFloor (transport, position, signal) {
   return false
 }
 
-async function moveOnSupportedFloor (bot, target, { signal, timeoutMs, tolerance = 0.15 } = {}) {
+async function moveOnSupportedFloor (bot, target, { signal, timeoutMs, tolerance = 0.15, isCurrent, canCleanup } = {}) {
   const t = bot.transport
-  const position = t.pos
+  if (!currentLease(isCurrent)) throw new Error('action lease is no longer current')
+  const position = nativePosition(t)
   if (!position) throw new Error('bot position is unknown')
   const dx = target.x - position.x, dz = target.z - position.z
   const distance = Math.hypot(dx, dz)
@@ -219,13 +309,14 @@ async function moveOnSupportedFloor (bot, target, { signal, timeoutMs, tolerance
   const unitX = dx / distance, unitZ = dz / distance
   const yaw = Math.atan2(-dx, -dz)
   if (!await t.look(yaw, 0, true)) throw new Error('cannot face the waypoint')
+  if (!currentLease(isCurrent)) throw new Error('action lease is no longer current')
   const startedAt = Date.now()
   if (!t.setControl('forward', true)) throw new Error('cannot move forward')
   try {
     while (Date.now() - startedAt < timeoutMs) {
-      const stopped = reasonToStop(bot, signal)
+      const stopped = reasonToStop(bot, signal, isCurrent)
       if (stopped) throw new Error(stopped)
-      const p = t.pos
+      const p = nativePosition(t)
       if (!p) throw new Error('bot position is unknown')
       if (Math.abs(p.y - target.y) > 0.6) throw new Error('bot changed height while crossing')
       const movedX = p.x - position.x, movedZ = p.z - position.z
@@ -235,13 +326,18 @@ async function moveOnSupportedFloor (bot, target, { signal, timeoutMs, tolerance
       if (forward >= distance - tolerance) return
       await sleep(50)
     }
-    const p = t.pos
+    const p = nativePosition(t)
     throw new Error(`movement timed out near ${p?.x?.toFixed(2)},${p?.y?.toFixed(2)},${p?.z?.toFixed(2)} toward ${target.x},${target.y},${target.z}`)
-  } finally { t.setControl('forward', false) }
+  } finally {
+    if (mayCleanup(canCleanup)) t.setControl('forward', false)
+  }
 }
 
 /** Bridge to a configured neighboring island, stopping only after the endpoint is reached. */
-export async function bridgeToNeighbor (bot, geometry, { fromId = geometry?.home?.id, targetId, visitedIds = [], signal, maxDistance = DEFAULT_MAX_BRIDGE_LENGTH, stepTimeoutMs = DEFAULT_STEP_TIMEOUT_MS } = {}, log = console) {
+export async function bridgeToNeighbor (bot, geometry, {
+  fromId = geometry?.home?.id, targetId, visitedIds = [], signal, isCurrent, canCleanup,
+  maxDistance = DEFAULT_MAX_BRIDGE_LENGTH, stepTimeoutMs = DEFAULT_STEP_TIMEOUT_MS
+} = {}, log = console) {
   const startedAt = Date.now()
   const base = { action: 'bedwarsBridge', bot: bot?.username, botId: bot?.id, fromId, targetId: targetId ?? null, placed: 0, steps: 0, reached: false }
   const fail = (error) => ({ ...base, status: 'FAILED', error, latencyMs: Date.now() - startedAt })
@@ -268,10 +364,10 @@ export async function bridgeToNeighbor (bot, geometry, { fromId = geometry?.home
 
   const t = bot?.transport
   if (!t?.physics || !t.mc) return fail('bridging needs the mineflayer physics transport')
-  const stopped = reasonToStop(bot, signal)
+  const stopped = reasonToStop(bot, signal, isCurrent)
   if (stopped) return fail(stopped)
 
-  const approach = await walkToWaypoint(bot, start, { signal })
+  const approach = await walkToWaypoint(bot, start, { signal, isCurrent, canCleanup })
   if (approach.status !== 'OK') return fail(`cannot reach bridge start: ${approach.error}`)
 
   try {
@@ -279,12 +375,14 @@ export async function bridgeToNeighbor (bot, geometry, { fromId = geometry?.home
     if (!t.setControl('sneak', true)) throw new Error('cannot hold sneak')
     // Pathfinder reaches a block, not its center. Align while standing on its known solid floor
     // before approaching the first gap; later steps also end near block centers.
-    await moveOnSupportedFloor(bot, { x: start.x + 0.5, y: start.y, z: start.z + 0.5 }, { signal, timeoutMs: stepTimeoutMs, tolerance: 0.12 })
+    await moveOnSupportedFloor(bot, { x: start.x + 0.5, y: start.y, z: start.z + 0.5 }, {
+      signal, timeoutMs: stepTimeoutMs, tolerance: 0.12, isCurrent, canCleanup
+    })
     if (!sameCell(currentCell(t), start)) throw new Error('bot left the configured bridge start')
     if (!await equipWool(t)) throw new Error('no wool in the inventory')
 
     for (let n = 1; n <= route.distance; n++) {
-      const stopped = reasonToStop(bot, signal)
+      const stopped = reasonToStop(bot, signal, isCurrent)
       if (stopped) throw new Error(stopped)
       const here = { x: start.x + route.dx * (n - 1), y: start.y, z: start.z + route.dz * (n - 1) }
       const next = { x: here.x + route.dx, y: here.y, z: here.z + route.dz }
@@ -307,14 +405,17 @@ export async function bridgeToNeighbor (bot, geometry, { fromId = geometry?.home
         if (!woolItems(t).length) throw new Error('ran out of wool before reaching the island')
         if (!await equipWool(t)) throw new Error('cannot equip wool')
         const placed = await t.placeBlockAt({ x: here.x, y: here.y - 1, z: here.z }, { x: route.dx, y: 0, z: route.dz })
-        if (!placed || !await waitForSolidFloor(t, next, signal)) {
+        if (!placed || !await waitForSolidFloor(t, next, signal, isCurrent)) {
           throw new Error(`wool placement was not confirmed at ${next.x},${next.y - 1},${next.z}`)
         }
         base.placed++
       }
 
+      if (!currentLease(isCurrent)) throw new Error('action lease is no longer current')
       if (!await t.look(route.yaw, 0, true)) throw new Error('cannot face bridge direction')
-      await moveOnSupportedFloor(bot, { x: next.x + 0.5, y: next.y, z: next.z + 0.5 }, { signal, timeoutMs: stepTimeoutMs, tolerance: 0.17 })
+      await moveOnSupportedFloor(bot, { x: next.x + 0.5, y: next.y, z: next.z + 0.5 }, {
+        signal, timeoutMs: stepTimeoutMs, tolerance: 0.17, isCurrent, canCleanup
+      })
       if (!sameCell(currentCell(t), next)) throw new Error(`bot did not reach bridge step ${n}`)
       requireSafeCell(t, next)
       base.steps++
@@ -327,8 +428,10 @@ export async function bridgeToNeighbor (bot, geometry, { fromId = geometry?.home
     log.warn?.(`[${bot?.username}] bridge to ${target.id} stopped after ${base.placed} placed/${base.steps} steps: ${error.message}`)
     return fail(error.message)
   } finally {
-    t.setControl('forward', false)
-    t.setControl('sneak', false)
-    t.clearControls?.()
+    if (mayCleanup(canCleanup)) {
+      t.setControl('forward', false)
+      t.setControl('sneak', false)
+      t.clearControls?.()
+    }
   }
 }

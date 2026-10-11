@@ -16,7 +16,8 @@ import { buildRuntime, parseAddress } from './runtime.js'
 import { Reporter } from './report/reporter.js'
 import { loadConfig, loadAccounts, applyCommands, ROOT } from './config/load.js'
 import { defaultPartyPlan } from './behaviour/party.js'
-import { join } from 'node:path'
+import { ProxyManager } from './proxy/manager.js'
+import { dirname, join } from 'node:path'
 
 const argv = process.argv.slice(2)
 const arg = (name, dflt) => { const i = argv.indexOf('--' + name); return i >= 0 ? argv[i + 1] : dflt }
@@ -33,8 +34,13 @@ async function main () {
   const cfg = loadConfig(cfgPath)
   const accountsFile = arg('accounts', cfg.accountsFile)
   const accounts = loadAccounts(accountsFile)
-  const size = Math.min(Number(arg('bots', cfg.fleet.size)), accounts.length)
+  const requestedSize = Number(arg('bots', cfg.fleet.size))
+  if (!Number.isInteger(requestedSize) || requestedSize < 1) throw new Error(`invalid bot count: ${requestedSize}`)
+  const size = Math.min(requestedSize, accounts.length)
+  cfg.fleet.requestedSize = requestedSize
+  cfg.fleet.availableAccounts = accounts.length
   const roster = accounts.slice(0, size)
+  const proxyManager = await ProxyManager.open({ file: cfg.proxyFile })
 
   if (arg('leader')) {
     const idx = roster.findIndex((a) => a.username === arg('leader'))
@@ -47,32 +53,53 @@ async function main () {
   applyCommands(engine, cfg)
 
   const jsonl = arg('jsonl', cfg.report.jsonl ? join(ROOT, cfg.report.jsonl) : null)
-  const reporter = new Reporter({ bus, log, jsonlPath: jsonl, ringSize: cfg.report.ringSize })
+  const networkJsonl = jsonl ? join(dirname(jsonl), 'network.jsonl') : null
+  const matchDebugJsonl = jsonl ? join(dirname(jsonl), 'match-debug.jsonl') : null
+  const reporter = new Reporter({ bus, log, jsonlPath: jsonl, networkJsonlPath: networkJsonl, matchDebugJsonlPath: matchDebugJsonl, ringSize: cfg.report.ringSize })
 
   const app = {
-    cfg, cfgPath, accountsFile, bus, engine, reporter, log,
-    runtime: buildRuntime({ bus, engine, cfg, roster, log }),
+    cfg, cfgPath, accountsFile, proxyManager, bus, engine, reporter, log,
+    runtime: buildRuntime({ bus, engine, cfg, roster, proxyManager, log }),
     get fleet () { return this.runtime.fleet },
     /** Swap in a brand-new roster. Stops the old fleet first so its sockets are gone before
      *  the new bots claim the same account names — two live connections under one name are
      *  refused by the server with "The same username is already playing on the server!". */
     async rebuild (nextRoster) {
       const old = this.runtime
+      await old.partyStatus?.prepareDisconnect(old.fleet.bots)
       await old.fleet.shutdown('rebuild')
       old.dispose()          // drop the old runtime's bus handlers BEFORE the new bots take the same ids
       cfg.fleet.leaderIndex = 0
-      this.runtime = buildRuntime({ bus: this.bus, engine: this.engine, cfg: this.cfg, roster: nextRoster, log: this.log })
+      this.runtime = buildRuntime({
+        bus: this.bus,
+        engine: this.engine,
+        cfg: this.cfg,
+        roster: nextRoster,
+        proxyManager: this.proxyManager,
+        log: this.log
+      })
       return this.runtime.fleet
     }
   }
 
   log.say(`mcbotctl — ${size} bot(s) -> ${cfg.server.host}:${cfg.server.port} (MC ${cfg.server.version})`)
+  if (requestedSize > accounts.length) {
+    log.warn(`fleet requested ${requestedSize} bot(s), but only ${accounts.length} account(s) are configured; active roster is ${size}`)
+  }
   log.say(`auth: ${cfg.auth?.enabled ? `on (${cfg.auth.strategy})` : 'off'}   engine: ${engine.list().length} command(s)   joinGuard: ${cfg.engine.joinGuardMs}ms`)
   log.say('')
 
   // Danger signals get printed immediately: a kick is never just a log line.
   bus.on(EV.MC_KICK, (e) => log.warn(`[${e.bot}] KICKED: ${e.text}`))
   bus.on(EV.MC_DISCONNECT, (e) => log.warn(`[${e.bot}] DISCONNECTED: ${e.text}`))
+  bus.on(EV.MC_END, (e) => {
+    const socket = e.socket
+    const detail = socket?.event
+      ? ` (TCP ${socket.event}${socket.errorCode ? `, ${socket.errorCode}` : ''}${socket.hadError ? ', had error' : ''})`
+      : ''
+    log.warn(`[${e.bot}] CONNECTION ENDED: ${e.reason ?? 'socket closed'}${detail}`)
+  })
+  bus.on(EV.MC_ERROR, (e) => log.warn(`[${e.bot}] CONNECTION ERROR: ${e.error?.message ?? e.error}`))
   bus.on(EV.AUTH_FAIL, (e) => log.warn(`[${e.bot}] auth failed: ${e.pattern}${e.fatal ? ' — NOT retrying' : ''}`))
   // A throwing bus handler is isolated by design. Surface it instead of losing it.
   bus.on(EV.BUS_ERROR, (e) => log.warn(`bus handler threw on "${e.topic}": ${e.error?.message}`))

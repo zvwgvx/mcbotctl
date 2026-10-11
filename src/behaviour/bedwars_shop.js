@@ -4,6 +4,7 @@
 import { EV } from '../bus.js'
 import { stripLegacy } from '../util.js'
 import { findShopCandidates, approachShopCandidate } from './bedwars_npc.js'
+import { nativeFallReason, nativePosition } from './motion_safety.js'
 
 const IRON_INGOT = 265
 const WOOL = 35
@@ -85,10 +86,23 @@ function withAbortOrTimeout (promise, signal, timeoutMs) {
   })
 }
 
-function stateError (bot, signal) {
+function currentLease (isCurrent) {
+  if (typeof isCurrent !== 'function') return true
+  try { return isCurrent() === true } catch { return false }
+}
+
+function mayCleanup (canCleanup) {
+  if (typeof canCleanup !== 'function') return true
+  try { return canCleanup() === true } catch { return false }
+}
+
+function stateError (bot, signal, isCurrent) {
+  if (!currentLease(isCurrent)) return 'action lease is no longer current'
   if (signal?.aborted) return 'aborted'
   if (!bot.transport?.connected) return 'transport disconnected'
   if (!bot.isReady()) return `bot is ${bot.fsm?.state}, not READY`
+  const fall = nativeFallReason(bot.transport)
+  if (fall) return fall
   return null
 }
 
@@ -97,8 +111,220 @@ function wholeNumber (value, fallback) {
   return Number.isInteger(n) && n > 0 ? n : fallback
 }
 
+function boundedNumber (value, fallback, min, max) {
+  const n = Number(value)
+  return Number.isFinite(n) && n >= min && n <= max ? n : fallback
+}
+
+function finitePoint (point) {
+  return !!point && ['x', 'y', 'z'].every((axis) => Number.isFinite(point[axis]))
+}
+
+function cellAt (point) {
+  if (!finitePoint(point)) return null
+  return { x: Math.floor(point.x), y: Math.floor(point.y), z: Math.floor(point.z) }
+}
+
+function pointKey (point) { return point ? `${point.x}:${point.y}:${point.z}` : '' }
+
+// Keep the last inventory count outside the cell-key namespace. A Map is passed between roam
+// segments, so this watermark makes each inventory increase count once rather than once per poll.
+const INVENTORY_EVIDENCE_KEY = '\u0000iron-inventory'
+
+function generatorDiscoverySpec (cfg = {}) {
+  return {
+    // Dynamic discovery always needs corroboration. A value of 1 would turn one player-thrown
+    // item or one accidental pickup back into a false positive.
+    confirmations: Math.max(2, Math.min(16, wholeNumber(cfg.confirmations, 2))),
+    maxDistance: boundedNumber(cfg.maxDistance, 12, 1, 64),
+    // A genuine BedWars generator produces successive drops over time. Requiring a small gap
+    // rejects a player handing over a stack or several stacks in one burst at a random location.
+    pickupMinIntervalMs: boundedNumber(cfg.pickupMinIntervalMs, 400, 100, 5000),
+    evidenceWindowMs: boundedNumber(cfg.evidenceWindowMs, 10000, 1000, 60000)
+  }
+}
+
+function freshGeneratorRecord (point, distance, now) {
+  return {
+    point: { ...point },
+    distance,
+    ids: new Set(),
+    pickupEvents: 0,
+    lastPickupAt: null,
+    lastSeenAt: now
+  }
+}
+
+function liveGeneratorRecord (sightings, point, distance, now, evidenceWindowMs) {
+  const key = pointKey(point)
+  let record = sightings.get(key)
+  if (!record || now - Number(record.lastSeenAt ?? 0) > evidenceWindowMs) {
+    record = freshGeneratorRecord(point, distance, now)
+  }
+  const previousDistance = Number(record.distance)
+  record.distance = Math.min(Number.isFinite(previousDistance) ? previousDistance : distance, distance)
+  record.lastSeenAt = now
+  sightings.set(key, record)
+  return record
+}
+
+function pruneGeneratorEvidence (sightings, now, evidenceWindowMs) {
+  for (const [key, record] of sightings) {
+    if (key === INVENTORY_EVIDENCE_KEY) continue
+    if (now - Number(record?.lastSeenAt ?? 0) > evidenceWindowMs) sightings.delete(key)
+  }
+}
+
+function droppedItem (entity) {
+  try {
+    const item = entity?.getDroppedItem?.()
+    if (item) return item
+  } catch {}
+  // Mineflayer exposes the item stack in entity metadata on older protocol versions. Keep this
+  // fallback deliberately narrow: a held item on a player is never evidence of a generator.
+  const name = String(entity?.name ?? '').toLowerCase()
+  if (name !== 'item' && name !== 'item_stack') return null
+  const metadata = entity?.metadata
+  if (!Array.isArray(metadata)) return null
+  return metadata.find((entry) => entry && typeof entry === 'object' &&
+    (entry.type != null || entry.itemId != null || entry.blockId != null || entry.name != null)) ?? null
+}
+
+/**
+ * Return actual, loaded iron-ingot drops near the bot. A generator produces these entities;
+ * ordinary inventory contents or an NPC name must never be treated as generator evidence.
+ */
+export function nearbyIronDrops (bot, { maxDistance = 12 } = {}) {
+  const transport = bot?.transport
+  const me = nativePosition(transport)
+  if (!transport?.connected || !finitePoint(me) || typeof transport.loadedEntities !== 'function') return []
+  const radius = boundedNumber(maxDistance, 12, 1, 64)
+  const result = []
+  for (const entity of transport.loadedEntities()) {
+    if (!finitePoint(entity?.position)) continue
+    const item = droppedItem(entity)
+    const id = Number(item?.type ?? item?.itemId ?? item?.blockId ?? item?.id)
+    const name = String(item?.name ?? '').toLowerCase()
+    if (id !== IRON_INGOT && name !== 'iron_ingot') continue
+    const distance = Math.hypot(entity.position.x - me.x, entity.position.y - me.y, entity.position.z - me.z)
+    if (distance > radius) continue
+    const point = cellAt(entity.position)
+    if (!point) continue
+    result.push({ id: entity.id ?? null, point, distance, count: Math.max(1, Number(item?.count ?? item?.itemCount) || 1) })
+  }
+  return result.sort((a, b) => a.distance - b.distance || a.point.y - b.point.y || a.point.x - b.point.x || a.point.z - b.point.z)
+}
+
+/**
+ * Observe dynamic generator evidence from data the client has already received.  A candidate
+ * needs either distinct iron item entities at one cell or repeated, time-separated inventory
+ * increases while standing in one cell.  One arbitrary player drop must never mark that cell as
+ * a BedWars generator.
+ */
+export function observeIronGenerator (bot, generatorCfg = {}, sightings = new Map(), { initialIron } = {}) {
+  const evidence = sightings instanceof Map ? sightings : new Map()
+  const spec = generatorDiscoverySpec(generatorCfg)
+  const now = Date.now()
+  pruneGeneratorEvidence(evidence, now, spec.evidenceWindowMs)
+
+  const resources = resourceCounts(bot)
+  const observedIron = Number(resources?.iron)
+  const iron = Number.isFinite(observedIron) ? Math.max(0, observedIron) : null
+  const here = cellAt(nativePosition(bot?.transport))
+  let inventory = evidence.get(INVENTORY_EVIDENCE_KEY)
+  if (!inventory || typeof inventory !== 'object') {
+    const baseline = Number(initialIron)
+    inventory = { lastIron: Number.isFinite(baseline) ? Math.max(0, baseline) : iron, lastSeenAt: now }
+    evidence.set(INVENTORY_EVIDENCE_KEY, inventory)
+  }
+
+  const beforeIron = Number(inventory.lastIron)
+  if (iron != null && here && Number.isFinite(beforeIron) && iron > beforeIron) {
+    const record = liveGeneratorRecord(evidence, here, 0, now, spec.evidenceWindowMs)
+    const sincePickup = record.lastPickupAt == null ? Infinity : now - record.lastPickupAt
+    if (sincePickup > spec.evidenceWindowMs) {
+      record.pickupEvents = 1
+    } else if (sincePickup >= spec.pickupMinIntervalMs) {
+      record.pickupEvents = Math.max(0, Number(record.pickupEvents) || 0) + 1
+    }
+    // A burst is deliberately remembered as one event; a following confirmed, time-separated
+    // gain can still provide the second observation.
+    record.lastPickupAt = now
+    record.lastSeenAt = now
+    inventory.lastIron = iron
+    inventory.lastSeenAt = now
+    if (record.pickupEvents >= spec.confirmations) {
+      return {
+        point: { ...record.point }, source: 'iron_pickup_cadence', sightings: record.pickupEvents,
+        distance: 0, iron
+      }
+    }
+  } else if (iron != null) {
+    inventory.lastIron = iron
+    inventory.lastSeenAt = now
+  }
+  evidence.set(INVENTORY_EVIDENCE_KEY, inventory)
+
+  for (const drop of nearbyIronDrops(bot, { maxDistance: spec.maxDistance })) {
+    // Sampling one loose ingot repeatedly only proves that it stayed on the floor. Separate
+    // Mineflayer entity ids at one cell are required before a visible drop cluster is accepted.
+    if (drop.id == null) continue
+    const record = liveGeneratorRecord(evidence, drop.point, drop.distance, now, spec.evidenceWindowMs)
+    record.ids.add(String(drop.id))
+    if (record.ids.size >= spec.confirmations) {
+      return {
+        point: { ...record.point }, source: 'iron_drop_cluster', sightings: record.ids.size,
+        distance: record.distance, iron
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Confirm a local BedWars generator without a map-specific coordinate. The probe never writes
+ * movement controls: it only watches item entities in chunks that are already loaded. A later
+ * pathfinding step still validates the candidate floor before walking to it.
+ */
+export async function locateIronGenerator (bot, bedwarsCfg = {}, { signal, isCurrent } = {}) {
+  const at = Date.now()
+  const cfg = bedwarsCfg.generatorDiscovery ?? {}
+  const timeoutMs = wholeNumber(cfg.timeoutMs, 8000)
+  const pollMs = wholeNumber(cfg.pollMs, 250)
+  const discovery = generatorDiscoverySpec(cfg)
+  const { confirmations, maxDistance } = discovery
+  const base = { action: 'locateGenerator', bot: bot?.username, botId: bot?.id, at, timeoutMs, confirmations, maxDistance }
+  const done = (status, extra = {}) => ({ ...base, status, ...extra, latencyMs: Date.now() - at })
+  if (typeof bot?.transport?.loadedEntities !== 'function') {
+    return done('BLOCKED', { error: 'transport cannot inspect loaded item entities; configure bedwars.geometry.home.generator' })
+  }
+
+  const initialResources = resourceCounts(bot)
+  const initialIronValue = Number(initialResources?.iron)
+  const initialIron = Number.isFinite(initialIronValue) ? Math.max(0, initialIronValue) : null
+  const sightings = new Map()
+  const deadline = at + timeoutMs
+  while (Date.now() < deadline) {
+    const error = stateError(bot, signal, isCurrent)
+    if (error) return done('FAILED', { error })
+
+    const generator = observeIronGenerator(bot, cfg, sightings, { initialIron })
+    if (generator) {
+      return done('OK', {
+        generator,
+        atGenerator: generator.distance <= 1.25,
+        iron: generator.iron
+      })
+    }
+    await waitTick(Math.min(pollMs, Math.max(1, deadline - Date.now())), signal)
+  }
+  return done('BLOCKED', {
+    error: `no nearby iron generator evidence after ${timeoutMs}ms; configure bedwars.geometry.home.generator or increase generatorDiscovery.maxDistance`
+  })
+}
+
 /** Wait for automatic generator pickup, returning a finite, abortable result. */
-export async function waitForIron (bot, bedwarsCfg = {}, { signal } = {}) {
+export async function waitForIron (bot, bedwarsCfg = {}, { signal, isCurrent, timeoutStatus = 'FAILED' } = {}) {
   const at = Date.now()
   const ironRequired = wholeNumber(bedwarsCfg.ironRequired, DEFAULT_BEDWARS_SHOP.ironRequired)
   const timeoutMs = wholeNumber(bedwarsCfg.collectTimeoutMs, DEFAULT_BEDWARS_SHOP.collectTimeoutMs)
@@ -112,10 +338,10 @@ export async function waitForIron (bot, bedwarsCfg = {}, { signal } = {}) {
   if (typeof bot.transport?.inventoryItems !== 'function') return done('FAILED', 'transport has no player inventory view')
   const deadline = at + timeoutMs
   while (true) {
-    const error = stateError(bot, signal)
+    const error = stateError(bot, signal, isCurrent)
     if (error) return done('FAILED', error)
     if (resourceCounts(bot).iron >= ironRequired) return done('OK')
-    if (Date.now() >= deadline) return done('FAILED', `only ${resourceCounts(bot).iron}/${ironRequired} iron after ${timeoutMs}ms at the generator`)
+    if (Date.now() >= deadline) return done(timeoutStatus, `only ${resourceCounts(bot).iron}/${ironRequired} iron after ${timeoutMs}ms at the verified generator`)
     await waitTick(Math.min(pollMs, deadline - Date.now()), signal)
   }
 }
@@ -208,10 +434,10 @@ function watchShopWindows (bot) {
   return { snapshot, close: () => { offItems() } }
 }
 
-async function waitForWindow (bot, watcher, timeoutMs, signal) {
+async function waitForWindow (bot, watcher, timeoutMs, signal, isCurrent) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const error = stateError(bot, signal)
+    const error = stateError(bot, signal, isCurrent)
     if (error) return { error }
     const window = watcher.snapshot()
     if (window) return { window }
@@ -220,10 +446,10 @@ async function waitForWindow (bot, watcher, timeoutMs, signal) {
   return { error: 'shop window did not provide inventory contents within ' + timeoutMs + 'ms' }
 }
 
-async function waitForWindowChange (bot, watcher, previous, timeoutMs, signal) {
+async function waitForWindowChange (bot, watcher, previous, timeoutMs, signal, isCurrent) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const error = stateError(bot, signal)
+    const error = stateError(bot, signal, isCurrent)
     if (error) return { error }
     const window = watcher.snapshot()
     if (window && window.signature !== previous.signature) return { window }
@@ -296,11 +522,11 @@ async function clickMenuSlot (bot, shop, slot, signal) {
   return withAbortOrTimeout(bot.transport.clickWindowConfirmed(slot, shop.button), signal, timeoutMs)
 }
 
-async function waitForOfferResult (bot, watcher, previous, before, timeoutMs, signal) {
+async function waitForOfferResult (bot, watcher, previous, before, timeoutMs, signal, isCurrent) {
   const deadline = Date.now() + timeoutMs
   let changed = null
   while (Date.now() < deadline) {
-    const error = stateError(bot, signal)
+    const error = stateError(bot, signal, isCurrent)
     if (error) return { error }
     const after = resourceCounts(bot)
     if (purchased(before, after)) return { after }
@@ -319,14 +545,14 @@ function describeCandidate (candidate) {
   return String(candidate.label || candidate.kind || candidate.id) + ' #' + candidate.id
 }
 
-async function inspectShop (bot, watcher, shop, initial, log, onPhase, signal) {
+async function inspectShop (bot, watcher, shop, initial, log, onPhase, signal, isCurrent) {
   let window = initial
   const path = []
   const seen = new Set()
   let lastClickBefore = null
   try {
     for (let depth = 0; depth <= shop.maxMenuDepth; depth++) {
-      const error = stateError(bot, signal)
+      const error = stateError(bot, signal, isCurrent)
       if (error) return { error }
       const counts = resourceCounts(bot)
       if (lastClickBefore && purchased(lastClickBefore, counts)) {
@@ -354,7 +580,7 @@ async function inspectShop (bot, watcher, shop, initial, log, onPhase, signal) {
           }
           if (clicked === ABORTED) return { error: 'aborted' }
           const outcome = await waitForOfferResult(bot, watcher, window, lastClickBefore,
-            wholeNumber(shop.purchaseTimeoutMs, 4000), signal)
+            wholeNumber(shop.purchaseTimeoutMs, 4000), signal, isCurrent)
           if (outcome.error) return outcome
           if (purchased(lastClickBefore, outcome.after)) {
             return { before: lastClickBefore, after: outcome.after, opened: window.title, woolSlot: offer.slot,
@@ -388,7 +614,7 @@ async function inspectShop (bot, watcher, shop, initial, log, onPhase, signal) {
         }
         if (clicked === ABORTED) return { error: 'aborted' }
         const transition = await waitForWindowChange(bot, watcher, window,
-          wholeNumber(shop.menuTransitionTimeoutMs, 3000), signal)
+          wholeNumber(shop.menuTransitionTimeoutMs, 3000), signal, isCurrent)
         if (transition.error === 'aborted' || transition.error === 'transport disconnected') return transition
         const after = resourceCounts(bot)
         if (purchased(lastClickBefore, after)) return { before: lastClickBefore, after, opened: window.title, path }
@@ -414,7 +640,9 @@ async function inspectShop (bot, watcher, shop, initial, log, onPhase, signal) {
  * Wait for generator iron, discover nearby NPCs, read shop pages and buy an affordable wool offer.
  * Inventory deltas, rather than click acknowledgements, prove the server completed the purchase.
  */
-export async function buyWool (bot, bedwarsCfg = {}, log = console, { signal, onPhase = () => {} } = {}) {
+export async function buyWool (bot, bedwarsCfg = {}, log = console, {
+  signal, isCurrent, canCleanup, onPhase = () => {}
+} = {}) {
   const at = Date.now()
   const shop = { ...DEFAULT_BEDWARS_SHOP.shop, ...(bedwarsCfg.shop ?? {}) }
   shop.mode = String(shop.mode ?? '').trim() || 'auto'
@@ -429,7 +657,7 @@ export async function buyWool (bot, bedwarsCfg = {}, log = console, { signal, on
   if (configError) return result('FAILED', configError)
   const t = bot.transport
   if (typeof t?.clickWindowConfirmed !== 'function') return result('FAILED', 'transport cannot click a shop window')
-  const collected = await waitForIron(bot, bedwarsCfg, { signal })
+  const collected = await waitForIron(bot, bedwarsCfg, { signal, isCurrent })
   if (collected.status !== 'OK') return result('FAILED', collected.error, { collected })
   if (t.openWindow) return result('FAILED', 'another window is already open: ' + t.openWindow.title)
   const before = resourceCounts(bot)
@@ -447,7 +675,7 @@ export async function buyWool (bot, bedwarsCfg = {}, log = console, { signal, on
   // Refresh discovery after every failed NPC. A server may spawn the real seller only after the
   // nearest decoy was already inspected, so a frozen first snapshot would miss it.
   while (true) {
-    const error = stateError(bot, signal)
+    const error = stateError(bot, signal, isCurrent)
     if (error) return result('FAILED', error, { before, attempts })
     let candidate = null
     if (npcMode) {
@@ -472,7 +700,7 @@ export async function buyWool (bot, bedwarsCfg = {}, log = console, { signal, on
     let entity = null
     if (candidate) {
       const approach = await approachShopCandidate(bot, candidate, {
-        signal, interactionDistance: shop.interactionDistance,
+        signal, isCurrent, canCleanup, interactionDistance: shop.interactionDistance,
         timeoutMs: wholeNumber(shop.approachTimeoutMs, 15000)
       })
       if (approach.status !== 'OK') {
@@ -503,10 +731,10 @@ export async function buyWool (bot, bedwarsCfg = {}, log = console, { signal, on
         attempts.push({ npc: label, error: 'could not activate shop' })
         continue
       }
-      const ready = await waitForWindow(bot, watcher, wholeNumber(shop.openTimeoutMs, 4000), signal)
+      const ready = await waitForWindow(bot, watcher, wholeNumber(shop.openTimeoutMs, 4000), signal, isCurrent)
       if (ready.error) {
         attempts.push({ npc: label, error: ready.error })
-        if (stateError(bot, signal)) return result('FAILED', stateError(bot, signal), { before, attempts })
+        if (stateError(bot, signal, isCurrent)) return result('FAILED', stateError(bot, signal, isCurrent), { before, attempts })
         continue
       }
       const initial = ready.window
@@ -514,7 +742,7 @@ export async function buyWool (bot, bedwarsCfg = {}, log = console, { signal, on
         attempts.push({ npc: label, error: 'opened "' + initial.title + '", expected "' + shop.expectTitle + '"' })
         continue
       }
-      const inspected = await inspectShop(bot, watcher, shop, initial, log, report, signal)
+      const inspected = await inspectShop(bot, watcher, shop, initial, log, report, signal, isCurrent)
       if (inspected.before && inspected.after && purchased(inspected.before, inspected.after)) {
         return result('OK', null, { before: inspected.before, after: inspected.after, npc: label,
           opened: inspected.opened, woolSlot: inspected.woolSlot ?? null, menuPath: inspected.path,
@@ -540,7 +768,9 @@ export async function buyWool (bot, bedwarsCfg = {}, log = console, { signal, on
       }
     } finally {
       watcher.close()
-      if (t.openWindow) {
+      // If a higher-priority action forced this lease out, its own cancellation cleanup has
+      // already closed the old window. Do not close whichever window the successor opened.
+      if (mayCleanup(canCleanup) && t.openWindow) {
         t.closeWindow?.()
         const closeDeadline = Date.now() + 1000
         while (t.openWindow && Date.now() < closeDeadline && !signal?.aborted) {
@@ -550,7 +780,7 @@ export async function buyWool (bot, bedwarsCfg = {}, log = console, { signal, on
       lastAttemptEndedAt = Date.now()
     }
   }
-  const reason = stateError(bot, signal)
+  const reason = stateError(bot, signal, isCurrent)
   if (reason) return result('FAILED', reason, { before, attempts })
   if (npcMode && !attempts.length) {
     return result('FAILED', 'no possible shop NPC is loaded within ' + shop.maxDistance + ' blocks', { before })

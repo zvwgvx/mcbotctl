@@ -4,6 +4,8 @@ node_modules/
 # /register, so this stays out of the repo even though it is only JSON.
 logs/*.log
 logs/*.jsonl
+logs/*.log.*
+logs/*.jsonl.*
 
 # Real credentials only. The two shipped *.example/testbed lists are placeholders.
 accounts/*.txt
@@ -12,6 +14,10 @@ accounts/*.txt
 
 # Your real config lives here. config/default.json is the sanitized one that ships.
 config/local.json
+
+# SOCKS5 endpoints and credentials managed by the dashboard.
+config/proxies.json
+config/proxies.json.tmp
 
 # Server runtime: world, jars, logs, plugin databases.
 server/data/

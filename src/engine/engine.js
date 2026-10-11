@@ -248,13 +248,13 @@ export class CommandEngine {
         })
       })
       const onTransportGone = (kind) => (e) => {
-        if (e.botId !== bot.id) return
+        if (e.botId !== bot.id || bot.acceptsConnectionEvent?.(e) === false) return
         finish(STATUS.ERROR, { error: `${kind}: ${e.text ?? e.reason ?? 'transport closed'}` })
       }
       const offKick = this.bus.on(EV.MC_KICK, onTransportGone('kicked'))
       const offDisc = this.bus.on(EV.MC_DISCONNECT, onTransportGone('disconnected'))
       const offEnd = this.bus.on(EV.MC_END, (e) => {
-        if (e.botId !== bot.id) return
+        if (e.botId !== bot.id || bot.acceptsConnectionEvent?.(e) === false) return
         finish(STATUS.ERROR, { error: `connection ended: ${e.reason}` })
       })
       // An INTENTIONAL disconnect emits none of the transport events above, so a command in

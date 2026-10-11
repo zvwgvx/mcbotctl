@@ -1,16 +1,25 @@
 {
   "$comment": "mcbotctl v1. Filled example; every value here was exercised against PaperSpigot 1.8.8-445 + AuthMe 5.6.0 on 127.0.0.1:25566.",
   "server": {
-    "host": "play.example.net",
+    "host": "play_pika-network_net.pika.host",
     "port": 25565,
     "version": "1.8.9",
     "chatVersion": "1.8",
     "_versionNote": "version MUST be present. minecraft-protocol 1.68.0 defaults to 26.1 and would handshake as a modern client. '1.8.9' is not in its supportedVersions array (which lists 1.8.8) but minecraft-data resolves both to protocol 47.",
     "_portNote": "25565 on this machine is an unrelated production Paper server. 25566 is the dockerised test bed.",
-    "checkTimeoutIntervalMs": 60000
+    "checkTimeoutIntervalMs": 300000,
+    "connectTimeoutMs": 30000,
+    "disconnectGraceMs": 2000,
+    "tcpKeepAliveInitialDelayMs": 10000,
+    "viewDistance": "tiny",
+    "maxCatchupTicks": 1
   },
   "accounts": {
     "file": "accounts/accounts.txt"
+  },
+  "proxy": {
+    "file": "config/proxies.json",
+    "_note": "SOCKS5 endpoints, credentials, routing mode, and manual bot assignments are stored in this ignored local file by the dashboard. Passwords are never returned through the state API."
   },
   "auth": {
     "enabled": true,
@@ -55,16 +64,17 @@
   },
   "fleet": {
     "size": 7,
-    "connectStaggerMs": 1000,
+    "connectStaggerMs": 3500,
     "readyTimeoutMs": 20000,
     "leaderIndex": 0,
-    "master": "PartyMaster",
+    "master": "zvwgvx",
     "_masterNote": "Account name of the human party owner. The 'form party' console action invites every bot, then invites the master, waits masterAcceptWaitMs, then transfers leadership to the master.",
     "masterAcceptWaitMs": 6000,
     "rejoinOnKick": true,
     "rejoinDelayMs": 3000,
-    "maxRejoinAttempts": 3,
-    "_rejoinNote": "A bot that is kicked waits rejoinDelayMs and reconnects up to maxRejoinAttempts times. Rejoining is suppressed during an intentional shutdown.",
+    "reconnectSettleMs": 500,
+    "maxRejoinAttempts": 0,
+    "_rejoinNote": "Automatic rejoin is disabled in this public-server profile. If it is enabled in another profile, a bot that is kicked waits rejoinDelayMs and reconnects up to maxRejoinAttempts times. Before a manual reconnect or fleet rebuild, each old TCP socket must close (or hit disconnectGraceMs) and then waits reconnectSettleMs before the same username connects again.",
     "_staggerNote": "One second between connections, on request. AuthMe AntiBot flips at the 11th connection in a 5s window, so 7 bots at 1s apart is 7 connections over ~7s - comfortably inside.",
     "progressiveParty": true,
     "_progressiveNote": "When on, the first bot to reach READY invites each other bot the moment it becomes READY, so the party fills as the fleet arrives instead of waiting for all seven.",
@@ -73,7 +83,22 @@
     "_offlineNote": "Once every bot is in the party, each one runs the offlineCommand. A status, not a disconnect: the account stays connected, it is just standing down. Fires once per connect.",
     "autoJoinOnInvite": true,
     "allowLeaderFallback": false,
-    "_inviteNote": "Bot 1 (fleet.leaderIndex) creates the party and invites everyone. The other bots recognise the invite in chat by themselves and run the accept command with the inviter's name. allowLeaderFallback false means no other bot will stand in for bot 1 as the party owner - on a real server that would change what every later command means."
+    "_inviteNote": "Bot 1 (fleet.leaderIndex) creates the party and invites everyone. The other bots recognise the invite in chat by themselves and run the accept command with the inviter's name. allowLeaderFallback false means no other bot will stand in for bot 1 as the party owner - on a real server that would change what every later command means.",
+    "masterCommandPrefix": "=",
+    "rejoinMaxDelayMs": 30000,
+    "stableRejoinResetMs": 30000,
+    "connectRetryBaseMs": 3000,
+    "connectRetryMaxMs": 30000,
+    "connectMaxRounds": 0,
+    "partyRetrySweepMs": 5000,
+    "partyInviteMaxAttempts": 0,
+    "partyInviteMinGapMs": 5000,
+    "partyInviteNoResponseCooldownMs": 10000,
+    "partyAcceptDelayMs": 350,
+    "partyAcceptUnconfirmedDelayMs": 1500,
+    "staleRxReconnectMs": 60000,
+    "staleRxTxRecentMs": 15000,
+    "staleRxRecoveryCooldownMs": 60000
   },
   "commands": {
     "_comment": "success/failure MUST be INSIDE each spec. Keys starting with _ are skipped by the loader, so do not put patterns there.",
@@ -94,11 +119,14 @@
       "template": "/p join {player}",
       "timeoutMs": 1500,
       "success": [
-        "mbpJoined"
+        "mbpJoined",
+        "mbpJoinedBroadcast"
       ],
       "failure": [
         "mbpNotInParty",
-        "mbpNoInvite"
+        "mbpNoInvite",
+        "mbpAlreadyInParty",
+        "mbpNotInvited"
       ],
       "_note": "Default changed to /p join on request: the target BedWars server answers /p join <leader>, not /p accept. This is operator-editable, and the test bed's plugin is configured to match so the suite exercises the same shape."
     },
@@ -114,7 +142,8 @@
       "template": "/p leave",
       "timeoutMs": 1500,
       "success": [
-        "mbpYouLeft"
+        "mbpYouLeft",
+        "mbpLeftBroadcast"
       ],
       "failure": [
         "mbpNotInParty",
@@ -125,7 +154,8 @@
       "template": "/p promote {player}",
       "timeoutMs": 1500,
       "success": [
-        "mbpTransferred"
+        "mbpTransferred",
+        "mbpPromoted"
       ],
       "failure": [
         "mbpNotInParty",
@@ -173,6 +203,7 @@
       "template": "/p promote {player}",
       "timeoutMs": 1500,
       "success": [
+        "mbpTransferred",
         "mbpPromoted"
       ],
       "failure": [
@@ -183,9 +214,11 @@
       ]
     },
     "chat": {
-      "template": "/pc {message}",
+      "template": "/p chat {message}",
       "timeoutMs": 1500,
-      "success": [],
+      "success": [
+        "partyChat"
+      ],
       "failure": [
         "mbpNotInParty"
       ]
@@ -197,15 +230,40 @@
       "failure": []
     },
     "_warpNote": "Warp comes from a server plugin (Essentials and similar), not from the reference party plugin, so it has no default success pattern and will report FAILED on a server without that plugin. Edit the template to match your server.",
-    "off": {
-      "template": "/off",
-      "timeoutMs": 1500,
+    "partyList": {
+      "template": "/party list",
+      "timeoutMs": 5000,
       "success": [
-        "mbpOfflineSelf"
+        "partyHeader",
+        "partyOwnerLine"
       ],
       "failure": [
         "mbpNotInParty"
       ]
+    },
+    "off": {
+      "template": "/off",
+      "timeoutMs": 1500,
+      "success": [
+        "mbpInvisibleSelf",
+        "mbpOfflineSelf",
+        "mbpStatusAlready"
+      ],
+      "failure": [
+        "mbpNotInParty"
+      ],
+      "areaExempt": true,
+      "phase": "status"
+    },
+    "on": {
+      "template": "/on",
+      "timeoutMs": 1500,
+      "success": [
+        "mbpOnlineSelf",
+        "mbpStatusAlready"
+      ],
+      "areaExempt": true,
+      "phase": "status"
     }
   },
   "patterns": {
@@ -256,16 +314,27 @@
     "_verified": "Measured against PaperSpigot 1.8.8 with plugin/.../MenuSim.java: hotbar slot 5 + right-click opened a 54-slot chest, and a right window_click on slot 30 (row 4, col 4) was received as button=RIGHT right=true window=CHEST.",
     "enabled": true,
     "gateParty": true,
-    "retries": 1,
-    "_gateNote": "When enabled and gateParty is on, a bot must complete this menu flow before it will invite or accept anything. A bot that never reaches the area stays out of the party, and the dashboard shows it, instead of the party quietly forming with bots standing in the wrong place. Turn enabled off on a server that has no such menu."
+    "retries": 2,
+    "_gateNote": "When enabled and gateParty is on, a bot must complete this menu flow before it will invite or accept anything. A bot that never reaches the area stays out of the party, and the dashboard shows it, instead of the party quietly forming with bots standing in the wrong place. Turn enabled off on a server that has no such menu.",
+    "verifyBedwars": true,
+    "maxRecoveryAttempts": 0,
+    "recoveryBaseMs": 3000,
+    "recoveryMaxMs": 30000
   },
   "movement": {
-    "enabled": true,
-    "speed": 0.215,
-    "directionChangeMs": 900,
+    "enabled": false,
+    "directionChangeMs": 1600,
     "tickMs": 50,
-    "_comment": "Random walk: one position packet per tick, heading re-rolled every directionChangeMs. speed is blocks per tick (a walking player is about 0.215, i.e. 4.3 blocks/second). It is not pathfinding - the bot wanders, it does not navigate. y always comes from the server, so a step or a fall is picked up from the server's correction rather than guessed.",
-    "_verified": "Measured on the live test server (test/move-probe.mjs): 160 position packets over 8s moved the bot 7.91 blocks as far as the SERVER reported, with 0 corrections and no kick."
+    "safetyScanMs": 150,
+    "lookAheadBlocks": 1,
+    "maxStepHeight": 0.6,
+    "sneakGuard": true,
+    "cautiousProbeMs": 250,
+    "headingAttempts": 8,
+    "fallLandingTimeoutMs": 5000,
+    "restartDelayMs": 750,
+    "_comment": "Continuous movement is disabled in this public-server profile. The private test profile uses Mineflayer's native forward/look controls and never writes calculated positions, velocity, or synthetic keep_alive packets.",
+    "_verified": "Mineflayer physics preserves the vanilla acceleration and falling model while the behaviour only supplies input controls."
   },
   "transport": "mineflayer",
   "_transportNote": "'mineflayer' uses the full library: real 1.8 physics (measured to match vanilla to four decimals, acceleration ramp included), answer to transaction packets, and block placement. 'raw' is the original minecraft-protocol client: lighter, but measured against a real anti-cheat it is silent at the packets that separate a client from a bot, and it cannot place blocks.",
@@ -279,12 +348,75 @@
     "_comment": "Sneak-bridge: hold sneak, walk in the yaw direction, place a block into the gap ahead of every step, release sneak when the bot can no longer move. yaw is 1.8 yaw - 0 faces +z (south), 90 faces -x (west). onObstacle: stop | back | up.",
     "_verified": "bot.placeBlock verified on 1.8.9 against the live server: the target square was AIR before and WOOL after, confirmed by the server's own view of that coordinate."
   },
+  "combat": {
+    "enabled": false,
+    "requireBedWarsMatch": true,
+    "requireTeamEvidence": false,
+    "range": 2.8,
+    "cooldownMs": 700,
+    "scanIntervalMs": 150,
+    "acquireMs": 250,
+    "lookTimeoutMs": 750,
+    "lineOfSight": true,
+    "lookAtTarget": true,
+    "pauseWhileMoving": true,
+    "requireGate": true,
+    "requireTargetApproval": true,
+    "requirePlayerInfo": true,
+    "targets": [],
+    "friends": [],
+    "_comment": "Disabled while the fleet is in the continuous-movement profile, so it cannot claim the view or interrupt roaming. It can be enabled later once combat is deliberately revisited."
+  },
   "bedwars": {
     "enabled": false,
-    "autoStart": true,
+    "autoStart": false,
     "startMessage": "",
+    "presence": {
+      "requireMatch": false,
+      "missingSidebarGraceMs": 5000,
+      "titlePattern": "\\bbed[\\s_-]*wars?\\b",
+      "teamLinePattern": "",
+      "joinMessage": "",
+      "matchMessage": "",
+      "leaveMessage": ""
+    },
     "ironRequired": 16,
     "collectTimeoutMs": 120000,
+    "generatorDiscovery": {
+      "enabled": true,
+      "maxDistance": 12,
+      "confirmations": 2,
+      "timeoutMs": 8000,
+      "pollMs": 250,
+      "pickupMinIntervalMs": 400,
+      "evidenceWindowMs": 10000,
+      "_comment": "A dynamic generator needs two independent iron-drop entities at one cell, or two inventory increases at one cell separated by pickupMinIntervalMs. A single player-thrown stack is ignored."
+    },
+    "roam": {
+      "enabled": true,
+      "tickMs": 50,
+      "telemetryIntervalMs": 250,
+      "minSegmentMs": 650,
+      "maxSegmentMs": 1400,
+      "minSegmentBlocks": 2,
+      "maxSegmentBlocks": 4,
+      "continuous": true,
+      "maxSegments": 64,
+      "maxSessionMs": false,
+      "directionWaitMs": 10000,
+      "maxTurnRadians": 1.5708,
+      "headingAttempts": 8,
+      "lookAheadBlocks": 1,
+      "noProgressMs": 750,
+      "progressDistance": 0.08,
+      "maxHorizontalSpeed": 0.34,
+      "settleSpeed": 0.04,
+      "settleTimeoutMs": 1200,
+      "lookTimeoutMs": 750,
+      "fallRecoveryTimeoutMs": 5000,
+      "scanIntervalMs": 250,
+      "_comment": "Unknown BedWars maps use continuous random exploration only after a confirmed match. The bot retains normal Mineflayer forward input across ordinary safe turns; it releases all controls only before an unsupported edge, while falling, or while native velocity is unsettled. maxSessionMs=false retains the supervised lease until match exit, cancellation, generator evidence, combat handoff, or a safety stop; set a positive value to roll over the lease periodically. maxSegments is a diagnostic cap only when continuous=false. directionWaitMs bounds a safe pause while chunks arrive and maxTurnRadians favors gradual safe turns. It sends Mineflayer input only and never calculated positions, velocity, or synthetic keep_alive packets."
+    },
     "walkTimeoutMs": 30000,
     "maxIslands": 1,
     "maxBridgeLength": 96,
@@ -306,6 +438,20 @@
       },
       "islands": []
     },
-    "_comment": "Configure generator and bridge geometry for the target BedWars map before enabling. In auto mode the bot locates nearby NPCs and reads their shop menus; shop name, location, title and wool slot are optional hints. Coordinates are block coordinates at the bot's feet. See BEDWARS.md."
+    "_comment": "Configure safe bridge geometry for the target BedWars map before expecting a crossing. home.generator is optional: without it autoplay continuously explores loaded, supported floor with native Mineflayer input and confirms either distinct nearby iron drops or time-separated pickups at one cell before routing to a generator. In auto mode the bot locates nearby NPCs and reads their shop menus; shop name, location, title and wool slot are optional hints. Coordinates are block coordinates at the bot's feet. See BEDWARS.md."
+  },
+  "autoplay": {
+    "enabled": false,
+    "autoStart": false,
+    "matchDebounceMs": 1750,
+    "actionCooldownMs": 350,
+    "recoverDelayMs": 1000,
+    "maxActionFailures": 3,
+    "maxIslands": 1,
+    "minWool": 16,
+    "bridgeWoolBuffer": 2,
+    "combatWindowMs": 1000,
+    "cancelGraceMs": 5000,
+    "_comment": "Disabled for the continuous-movement profile. =play and dashboard autoplay requests are rejected, so no generator, shop, bridge, or combat handoff can take control away from the native roaming loop."
   }
 }

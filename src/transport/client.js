@@ -25,6 +25,7 @@ import { createRequire } from 'node:module'
 import { EventEmitter } from 'node:events'
 import { EV } from '../bus.js'
 import { makeChatFlattener, flattenReason, stripLegacy } from '../util.js'
+import { connectViaSocks } from '../proxy/socks.js'
 
 const require = createRequire(import.meta.url)
 const mc = require('minecraft-protocol')
@@ -34,12 +35,13 @@ export class Transport extends EventEmitter {
   #closedByUs = false
 
 
-  constructor ({ botId, username, server, log, bus }) {
+  constructor ({ botId, username, server, proxyFor = null, log, bus }) {
     super()
     this.bus = bus
     this.botId = botId
     this.username = username
     this.server = server
+    this.proxyFor = proxyFor
     this.log = log
     this.flatten = makeChatFlattener(server.chatVersion ?? '1.8')
     this.joinedAt = null
@@ -60,6 +62,8 @@ export class Transport extends EventEmitter {
    *  which never reaches PLAY at all. */
   connect () {
     const { host, port, version } = this.server
+    const route = this.proxyFor?.() ?? { kind: 'direct', mode: 'off', blocked: false, proxy: null }
+    if (route.blocked) throw Object.assign(new Error(route.reason), { kind: 'proxy' })
     this.#closedByUs = false
     this.inventorySlots.clear()
     this.pendingWindowItems = null
@@ -69,12 +73,25 @@ export class Transport extends EventEmitter {
       username: this.username,
       version,               // MUST be explicit — see header
       auth: 'offline',       // account list is username:password, so auth is the login plugin's job
-      checkTimeoutInterval: this.server.checkTimeoutIntervalMs ?? 60000,
+      keepAlive: false,
+      ...(route.kind === 'proxy'
+        ? {
+            fakeHost: host,
+            connect: (client) => connectViaSocks(client, route, {
+              host,
+              port,
+              timeoutMs: this.server.connectTimeoutMs ?? 30000
+            })
+          }
+        : {}),
       // hideErrors stays false: protodef logs malformed-packet stacks to stdout via
       // console.log and does NOT emit 'error'. Leaving it visible is how a desync is noticed.
       hideErrors: false
     })
     const c = this.#client
+    c.on('keep_alive', (packet) => {
+      try { c.write('keep_alive', { keepAliveId: packet.keepAliveId }) } catch {}
+    })
 
     return new Promise((resolve, reject) => {
       let settled = false
@@ -309,6 +326,7 @@ export class Transport extends EventEmitter {
 
   end (reason = 'clientClosed') {
     this.#closedByUs = true
+    if (this.#client) this.#client.__mcbotctlConnectionCancelled = true
     try { this.#client?.end(reason) } catch { /* already gone */ }
   }
 }

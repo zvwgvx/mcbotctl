@@ -225,61 +225,58 @@ async function main () {
   check('and they are still connected while offline', os.bots.every((b) => b.ready),
     'a stand-down is a status, not a disconnect')
 
-  // ── 3. kick a member ──────────────────────────────────────────────────────
-  console.log('\n[3] kick one member')
+  console.log('\n[3] automatic repair after a member is kicked')
   const victim = s.bots.find((b) => b.party?.role === 'member')?.name
   const k = await act({ action: 'kick', target: victim })
   check(`kick ${victim} succeeds`, k.body.ok === true, JSON.stringify(k.body.result?.response ?? k.body.error ?? ''))
+  const repairDeadline = Date.now() + 30000
+  let repaired = false
+  let repairedServerSize = null
+  while (Date.now() < repairDeadline) {
+    await sleep(750)
+    s = await state()
+    const q2 = await askLeader('/p list', 1000)
+    repairedServerSize = q2.size
+    if (partyOf(s, victim) !== 'none' && q2.size === baseline) {
+      repaired = true
+      break
+    }
+  }
+  check(`${victim} reconnects to the canonical party without a manual invite`, repaired,
+    `role ${partyOf(s, victim)}; server Party (${repairedServerSize})`)
+  check(`${victim} stays connected during party repair`, s.bots.find((b) => b.name === victim)?.ready === true)
   await sleep(1500)
-  s = await state()
-  check(`kicked bot is no longer shown as in-party`, partyOf(s, victim) === 'none',
-    `${victim} shows "${partyOf(s, victim)}"`)
-  check(`kicked bot is STILL connected (green)`, s.bots.find((b) => b.name === victim)?.ready === true)
-  const q2 = await askLeader('/p list')
-  check('the server agrees the party shrank', q2.size === baseline - 1,
-    `server says Party (${q2.size}) (baseline ${baseline})`)
-
-  // ── 4. re-invite everyone puts them back ──────────────────────────────────
-  console.log('\n[4] invite all after the kick')
-  const inv = await act({ action: 'invite-all' })
-  check('invite-all reports no failures', inv.body.ok === true, JSON.stringify(inv.body.failed ?? []))
-  await sleep(1500)
-  s = await state()
-  check('the kicked bot is back in the party', partyOf(s, victim) !== 'none', `${victim} shows "${partyOf(s, victim)}"`)
-  const q3 = await askLeader('/p list')
-  check('the server agrees the party is full again', q3.size === baseline, `server says Party (${q3.size}) (baseline ${baseline})`)
-  await sleep(2500)
   const os2 = await state()
-  check('the stand-down re-arms when the party is rebuilt',
+  check('stand-down is restored after automatic member repair',
     os2.bots.filter((b) => b.offline).length === s0.bots.length,
-    `${os2.bots.filter((b) => b.offline).length}/${s0.bots.length} offline again`)
+    `${os2.bots.filter((b) => b.offline).length}/${s0.bots.length} offline`)
 
-  // ── 4a. a PENDING invite must not be scored as membership ─────────────────
-  // The plugin's invites are durable: once sent, they stay pending until accepted, denied, or
-  // the target quits. So "already invited into your party" is not "already in your party", and
-  // treating the two as one let Invite all report ok:true while the member sat outside.
-  console.log('\n[4a] a pending invite is not membership')
-  await act({ action: 'kick', target: victim })
-  await sleep(1200)
-  const oneShot = await act({ action: 'invite', target: victim })   // leaves an invite PENDING
-  check('a lone invite leaves the member outside the party',
-    oneShot.body.ok === true && (await state()).bots.find((b) => b.name === victim)?.party?.role === 'none',
-    `invite ${oneShot.body.result?.status}; role ${(await state()).bots.find((b) => b.name === victim)?.party?.role}`)
-  const repair = await act({ action: 'invite-all' })
-  await sleep(1500)
-  const q1 = await askLeader('/p list')
-  check('invite-all accepts the pending invite instead of skipping it',
-    repair.body.ok === true && q1.size === baseline,
-    `endpoint ${JSON.stringify({ ok: repair.body.ok, alreadyIn: repair.body.alreadyIn })}; server says Party (${q1.size})`)
+  console.log('\n[4] automatic repair after disband')
+  const d = await act({ action: 'disband' })
+  check('disband succeeds', d.body.ok === true, d.body.result?.response ?? '')
+  const disbandDeadline = Date.now() + 45000
+  let rebuilt = false
+  let rebuiltSize = null
+  while (Date.now() < disbandDeadline) {
+    await sleep(1000)
+    s = await state()
+    const q3 = await askLeader('/p list', 1000)
+    rebuiltSize = q3.size
+    if (roster(s).length === s0.bots.length && q3.size === baseline) {
+      rebuilt = true
+      break
+    }
+  }
+  check('the coordinator rebuilds the full party after disband', rebuilt,
+    `tracker ${roster(s).length}/${s0.bots.length}; server Party (${rebuiltSize})`)
+  const fleetLeaders = s.bots.filter((b) => b.party?.role === 'leader').map((b) => b.name)
+  check('the rebuilt fleet has only the canonical bot leader',
+    fleetLeaders.length === 1 && fleetLeaders[0] === s0.bots[0].name,
+    `leaders: ${fleetLeaders.join(',') || '(none)'}`)
 
-  // ── 4b. the burst must not trip the server's chat-spam kick ───────────────
-  // Measured rule on this server: +1 per command, -1 per second, kicked above ~10. Invite all
-  // is the biggest burst the tool issues, so it is the one that would trip it.
-  console.log('\n[4b] chat-spam budget survives the biggest burst')
-  await sleep(1000)
-  s = await state()
+  console.log('\n[4b] connection stability after automatic party repair')
   const kickedOut = s.bots.filter((b) => !b.ready).map((b) => b.name)
-  check('nobody was dropped by the invite-all burst', kickedOut.length === 0,
+  check('nobody was dropped by recovery traffic', kickedOut.length === 0,
     kickedOut.length ? `no longer ready: ${kickedOut.join(',')}` : 'all still ready')
 
   // ── 5. warp (server has no warp plugin) ───────────────────────────────────
@@ -288,32 +285,6 @@ async function main () {
   check('a missing warp plugin is reported, not swallowed',
     w.body.ok === false && /unknown command|not.*found/i.test(w.body.result?.response ?? ''),
     w.body.result?.response ?? '')
-
-  // ── 6. disband ────────────────────────────────────────────────────────────
-  console.log('\n[6] disband')
-  const d = await act({ action: 'disband' })
-  check('disband succeeds', d.body.ok === true, d.body.result?.response ?? '')
-  await sleep(1500)
-  s = await state()
-  check('nobody is in a party afterwards', roster(s).length === 0, `roster: ${roster(s).join(',') || '(none)'}`)
-
-  // ── 7. rebuild the party after a disband ──────────────────────────────────
-  console.log('\n[7] rebuild after disband')
-  const inv2 = await act({ action: 'invite-all' })
-  check('invite-all rebuilds from nothing', inv2.body.ok === true, JSON.stringify(inv2.body.failed ?? []))
-  await sleep(2500)
-  const q4 = await askLeader('/p list')
-  // On disagreement, show WHO is missing and what the engine actually saw, so the failure
-  // explains itself instead of needing another reproduction round.
-  let detail = `server says Party (${q4.size}) (baseline ${baseline})`
-  if (q4.size !== baseline) {
-    const st = await state()
-    const inP = new Set(st.bots.filter((b) => ['leader', 'member'].includes(b.party?.role)).map((b) => b.name))
-    const missing = st.bots.map((b) => b.name).filter((n) => !inP.has(n))
-    const perCmd = (inv2.body.results ?? []).map((r) => `${r.bot}:${r.action}:${r.status}:${r.pattern ?? ''}`)
-    detail += ` | tracker missing: ${missing.join(',') || '(none)'} | commands: ${perCmd.join(' ')}`
-  }
-  check('the server agrees the party is full', q4.size === baseline, detail)
 
   // ── 8. master invite + transfer ───────────────────────────────────────────
   console.log('\n[8] master')
@@ -457,37 +428,28 @@ async function main () {
   console.log('\n[10] the area gate')
   const setMenuCfg = (menu) => post('/api/config', { menu })
 
-  // (a) a menu that cannot be completed must stop the party forming at all
   await setMenuCfg({ enabled: true, gateParty: true, hotbarSlot: 1, row: 4, col: 4, expectTitle: '' })
   await act({ action: 'disconnect', bot: 'all' })
   await sleep(2000)
-  await post('/api/connect', { address: `${s0.server.host}:${s0.server.port}` })
-  await waitIdle(90000)
+  const gateConnect = await post('/api/connect', { address: `${s0.server.host}:${s0.server.port}` })
+  check('connect accepts the fleet even while the BedWars gate is temporarily broken', gateConnect.status === 202,
+    `HTTP ${gateConnect.status}`)
+  await waitReady(s0.bots.length, 60000)
   await sleep(4000)
   let gs = await state()
   const notIn = gs.bots.filter((b) => b.menu?.state !== 'done').length
-  check('a menu that never opens leaves every bot outside the area', notIn === s0.bots.length,
-    `${notIn}/${s0.bots.length} not in the area`)
-  check('and no party forms', roster(gs).length === 0, `roster: ${roster(gs).join(',') || '(none)'}`)
-  const blocked = await act({ action: 'invite-all' })
-  const blockedCount = (blocked.body.failed ?? []).filter((f) => f.status === 'BLOCKED').length
-  check('a party command is BLOCKED, not silently dropped',
-    blocked.body.ok === false && blockedCount > 0,
-    `${blockedCount} BLOCKED of ${(blocked.body.failed ?? []).length} failures`)
+  check('a broken selector keeps bots outside BedWars instead of forming a fake party', notIn === s0.bots.length && roster(gs).length === 0,
+    `${notIn}/${s0.bots.length} outside; roster ${roster(gs).length}`)
+  check('connect remains in recovery instead of declaring success', gs.running === true)
 
-  // (b) a correct menu lets them through, and only then does the party form
   await setMenuCfg({ enabled: true, gateParty: true, hotbarSlot: 5, row: 4, col: 4, expectTitle: '' })
-  await act({ action: 'disconnect', bot: 'all' })
-  await sleep(2000)
-  await post('/api/connect', { address: `${s0.server.host}:${s0.server.port}` })
-  await waitIdle(90000)
-  await sleep(6000)
+  check('fixing the selector lets the in-flight connect converge', await waitIdle(90000))
   gs = await state()
   const inside = gs.bots.filter((b) => b.menu?.state === 'done').length
-  check('a correct menu puts every bot in the area', inside === s0.bots.length,
+  check('every bot reaches BedWars after the live config repair', inside === s0.bots.length,
     `${inside}/${s0.bots.length} in the area`)
   const gateQ = await askLeader('/p list')
-  check('and the party forms once they are through', gateQ.size >= s0.bots.length,
+  check('one canonical full party forms after gate recovery', gateQ.size === s0.bots.length,
     `server says Party (${gateQ.size})`)
   await act({ action: 'disconnect', bot: 'all' })
 
